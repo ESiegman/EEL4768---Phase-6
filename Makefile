@@ -1,0 +1,29 @@
+.PHONY: help test ci schematics clean
+
+help:
+	@echo "make test        run your testbenches (writes results/local.txt)"
+	@echo "make ci          same thing, under the name CI uses (results/ci.txt)"
+	@echo "make schematics  synthesize alu/imm/rf/decoder/cache/fpu/hart with yosys and"
+	@echo "                 render gate-level SVGs with netlistsvg (build/schematics/)"
+	@echo "make clean       remove results/ and build/"
+	@echo
+	@echo "Details:      ./run_test.sh <name> [submission_dir]"
+	@echo "Write your own <check>_tb.v for alu, imm, rf_bypass, rf_no_bypass,"
+	@echo "decoder, cache, plru, fpu, hart_muldiv, hart_fp_move_compare,"
+	@echo "hart_fp_convert, hart_fp_arith, hart_fp_div_sqrt, hart_fp_csr, hart_mixed"
+	@echo "and hart_cache_stall -- see README.md and example/opmux_tb.v."
+	@echo "Run pip install ./lint once so make test also runs the ece552 rule"
+	@echo "checker. There is no autograder for phase 6; this only runs the"
+	@echo "testbenches you write."
+
+test:
+	@./run_test.sh local
+
+ci:
+	@./run_test.sh ci
+
+schematics:
+	@./gen_schematics.sh
+
+clean:
+	rm -rf results build
