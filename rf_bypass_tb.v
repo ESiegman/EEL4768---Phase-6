@@ -15,6 +15,15 @@ module rf_bypass_tb;
     reg  [31:0] rd_wdata;
     wire [31:0] rs1_rdata;
     wire [31:0] rs2_rdata;
+    reg  [ 4:0] frs1_raddr;
+    reg  [ 4:0] frs2_raddr;
+    reg  [ 4:0] frs3_raddr;
+    reg         frd_wen;
+    reg  [ 4:0] frd_waddr;
+    reg  [31:0] frd_wdata;
+    wire [31:0] frs1_rdata;
+    wire [31:0] frs2_rdata;
+    wire [31:0] frs3_rdata;
 
     integer passed;
     integer failed;
@@ -28,7 +37,16 @@ module rf_bypass_tb;
         .i_rs2_raddr (rs2_raddr),
         .o_rs2_rdata (rs2_rdata),
         .i_rd_waddr  (rd_waddr),
-        .i_rd_wdata  (rd_wdata)
+        .i_rd_wdata  (rd_wdata),
+        .i_frs1_raddr(frs1_raddr),
+        .o_frs1_rdata(frs1_rdata),
+        .i_frs2_raddr(frs2_raddr),
+        .o_frs2_rdata(frs2_rdata),
+        .i_frs3_raddr(frs3_raddr),
+        .o_frs3_rdata(frs3_rdata),
+        .i_frd_wen   (frd_wen),
+        .i_frd_waddr (frd_waddr),
+        .i_frd_wdata (frd_wdata)
     );
 
     always #5 clk = ~clk;
@@ -73,13 +91,50 @@ module rf_bypass_tb;
         end
     endtask
 
-    // wait one cycle, then idle the write port and drop reset
+    // wait one cycle, then idle both write ports and drop reset
     task next_cycle;
         begin
             @(negedge clk);
-            rd_waddr = 5'd0;
-            rd_wdata = 32'd0;
-            rst      = 1'b0;
+            rd_waddr  = 5'd0;
+            rd_wdata  = 32'd0;
+            frd_wen   = 1'b0;
+            frd_waddr = 5'd0;
+            frd_wdata = 32'd0;
+            rst       = 1'b0;
+        end
+    endtask
+
+    // set all three FP read addresses, wait #1, check all three ports
+    task fread3;
+        input [511:0] label;
+        input [  4:0] a1;
+        input [ 31:0] want1;
+        input [  4:0] a2;
+        input [ 31:0] want2;
+        input [  4:0] a3;
+        input [ 31:0] want3;
+        begin
+            frs1_raddr = a1;
+            frs2_raddr = a2;
+            frs3_raddr = a3;
+            #1;
+            check({label, " (testbench timing: clk low)"}, {31'd0, clk},
+                  32'd0);
+            check({label, " (frs1)"}, frs1_rdata, want1);
+            check({label, " (frs2)"}, frs2_rdata, want2);
+            check({label, " (frs3)"}, frs3_rdata, want3);
+        end
+    endtask
+
+    // write one FP register (called at a negedge)
+    task write_freg;
+        input [ 4:0] addr;
+        input [31:0] data;
+        begin
+            frd_wen   = 1'b1;
+            frd_waddr = addr;
+            frd_wdata = data;
+            next_cycle;
         end
     endtask
 
@@ -93,6 +148,20 @@ module rf_bypass_tb;
             next_cycle;
         end
     endtask
+
+    // distinct value per FP register, different from pat() so a read of the
+    // wrong register set shows up; f0..f2 are edge cases
+    function [31:0] fpat;
+        input [4:0] r;
+        begin
+            case (r)
+                5'd0:    fpat = 32'h7FC00000;
+                5'd1:    fpat = 32'h80000000;
+                5'd2:    fpat = 32'hFFFFFFFF;
+                default: fpat = {2'b01, r, 3'b110, ~r, 4'h9, r, 8'hF0};
+            endcase
+        end
+    endfunction
 
     // distinct value per register; x1..x3 are edge cases
     function [31:0] pat;
@@ -117,6 +186,12 @@ module rf_bypass_tb;
         rs2_raddr = 5'd0;
         rd_waddr  = 5'd0;
         rd_wdata  = 32'd0;
+        frs1_raddr = 5'd0;
+        frs2_raddr = 5'd0;
+        frs3_raddr = 5'd0;
+        frd_wen    = 1'b0;
+        frd_waddr  = 5'd0;
+        frd_wdata  = 32'd0;
 
         $display("========== rf_bypass testbench ==========");
 
@@ -281,6 +356,128 @@ module rf_bypass_tb;
               5'd20, 32'd0);
         read2("reset priority: other registers also 0", 5'd10, 32'd0,
               5'd31, 32'd0);
+
+        // --- 8. Floating-point registers (phase_6.pdf 5.2) -------------------
+        $display("--- 8a. FP reset ---");
+        sync;
+        write_freg(5'd0,  32'h3F800000);
+        write_freg(5'd13, 32'h13131313);
+        write_freg(5'd31, 32'h31313131);
+        fread3("fp reset: f0/f13/f31 written before reset", 5'd0, 32'h3F800000,
+               5'd13, 32'h13131313, 5'd31, 32'h31313131);
+        sync;
+        rst = 1'b1;
+        next_cycle;
+        for (i = 0; i < 32; i = i + 1) begin
+            sync;
+            fread3("fp reset: register reads +0.0 after reset", i[4:0], 32'd0,
+                   i[4:0], 32'd0, i[4:0], 32'd0);
+        end
+
+        $display("--- 8b. every FP register f0..f31 holds its own value ---");
+        sync;
+        for (i = 0; i < 32; i = i + 1)
+            write_freg(i[4:0], fpat(i[4:0]));
+        for (i = 0; i < 32; i = i + 1) begin
+            sync;
+            fread3("fp regs: same register on all ports", i[4:0], fpat(i[4:0]),
+                   i[4:0], fpat(i[4:0]), i[4:0], fpat(i[4:0]));
+        end
+        for (i = 0; i < 32; i = i + 1) begin
+            sync;
+            fread3("fp regs: different registers per port", i[4:0], fpat(i[4:0]),
+                   5'd31 - i[4:0], fpat(5'd31 - i[4:0]),
+                   i[4:0] ^ 5'b10101, fpat(i[4:0] ^ 5'b10101));
+        end
+
+        $display("--- 8c. f0 is an ordinary register ---");
+        sync;
+        write_freg(5'd0, 32'hC0490FDB);
+        fread3("fp f0: written value reads back", 5'd0, 32'hC0490FDB,
+               5'd0, 32'hC0490FDB, 5'd0, 32'hC0490FDB);
+
+        $display("--- 8d. write enable ---");
+        sync;
+        frd_wen   = 1'b0;
+        frd_waddr = 5'd6;
+        frd_wdata = 32'hDEADBEEF;
+        fread3("fp wen low: f6 not bypassed", 5'd6, fpat(5'd6),
+               5'd6, fpat(5'd6), 5'd6, fpat(5'd6));
+        next_cycle;
+        fread3("fp wen low: f6 unchanged after edge", 5'd6, fpat(5'd6),
+               5'd6, fpat(5'd6), 5'd6, fpat(5'd6));
+        sync;
+        frd_wen   = 1'b0;
+        frd_waddr = 5'd0;
+        frd_wdata = 32'hDEADBEEF;
+        next_cycle;
+        fread3("fp wen low: f0 unchanged after edge", 5'd0, 32'hC0490FDB,
+               5'd0, 32'hC0490FDB, 5'd0, 32'hC0490FDB);
+
+        $display("--- 8e. same-cycle FP read returns new value ---");
+        sync;
+        frd_wen   = 1'b1;
+        frd_waddr = 5'd9;
+        frd_wdata = 32'hA5A5A5A5;
+        fread3("fp same cycle: f9 on all ports", 5'd9, 32'hA5A5A5A5,
+               5'd9, 32'hA5A5A5A5, 5'd9, 32'hA5A5A5A5);
+        fread3("fp same cycle: only the port reading f9", 5'd8, fpat(5'd8),
+               5'd9, 32'hA5A5A5A5, 5'd10, fpat(5'd10));
+        next_cycle;
+        fread3("fp same cycle: f9 after edge", 5'd9, 32'hA5A5A5A5,
+               5'd9, 32'hA5A5A5A5, 5'd9, 32'hA5A5A5A5);
+        sync;
+        frd_wen   = 1'b1;
+        frd_waddr = 5'd0;
+        frd_wdata = 32'h00000000;
+        fread3("fp same cycle: f0 being written with +0.0", 5'd0, 32'h00000000,
+               5'd1, fpat(5'd1), 5'd0, 32'h00000000);
+        next_cycle;
+        fread3("fp same cycle: f0 after edge", 5'd0, 32'h00000000,
+               5'd0, 32'h00000000, 5'd0, 32'h00000000);
+
+        $display("--- 8f. integer and FP sets are separate ---");
+        sync;
+        rd_waddr  = 5'd5;
+        rd_wdata  = 32'h55555555;
+        frd_wen   = 1'b1;
+        frd_waddr = 5'd5;
+        frd_wdata = 32'hF5F5F5F5;
+        read2("separate: x5 while writing x5 and f5", 5'd5, 32'h55555555,
+              5'd5, 32'h55555555);
+        fread3("separate: f5 while writing x5 and f5", 5'd5, 32'hF5F5F5F5,
+               5'd5, 32'hF5F5F5F5, 5'd5, 32'hF5F5F5F5);
+        next_cycle;
+        read2("separate: x5 after edge", 5'd5, 32'h55555555, 5'd5, 32'h55555555);
+        fread3("separate: f5 after edge", 5'd5, 32'hF5F5F5F5,
+               5'd5, 32'hF5F5F5F5, 5'd5, 32'hF5F5F5F5);
+        sync;
+        frd_wen   = 1'b1;
+        frd_waddr = 5'd11;
+        frd_wdata = 32'h0BADF00D;
+        read2("separate: x11 while writing f11", 5'd11, 32'd0, 5'd11, 32'd0);
+        next_cycle;
+        read2("separate: x11 after writing f11", 5'd11, 32'd0, 5'd11, 32'd0);
+        sync;
+        rd_waddr = 5'd12;
+        rd_wdata = 32'h12121212;
+        fread3("separate: f12 while writing x12", 5'd12, fpat(5'd12),
+               5'd12, fpat(5'd12), 5'd12, fpat(5'd12));
+        next_cycle;
+        fread3("separate: f12 after writing x12", 5'd12, fpat(5'd12),
+               5'd12, fpat(5'd12), 5'd12, fpat(5'd12));
+
+        $display("--- 8g. reset beats an FP write in the same cycle ---");
+        sync;
+        rst       = 1'b1;
+        frd_wen   = 1'b1;
+        frd_waddr = 5'd20;
+        frd_wdata = 32'hFEEDFACE;
+        next_cycle;
+        fread3("fp reset priority: f20 is +0.0, not the write data", 5'd20, 32'd0,
+               5'd20, 32'd0, 5'd20, 32'd0);
+        fread3("fp reset priority: other FP registers also +0.0", 5'd0, 32'd0,
+               5'd9, 32'd0, 5'd31, 32'd0);
 
         $display("============================================");
         $display("%0d passed, %0d failed", passed, failed);

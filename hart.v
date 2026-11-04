@@ -103,7 +103,26 @@ module hart #(
     // the next program counter after the instruction is retired. For most
     // instructions, this is `o_retire_pc + 4`, but must be the branch or jump
     // target for *taken* branches and jumps.
-    output wire [31:0] o_retire_next_pc
+    output wire [31:0] o_retire_next_pc,
+    // F extension retire fields. The floating-point source registers read
+    // by the instruction being retired (addresses are the instruction's rs1,
+    // rs2 and rs3 fields) and their values as read in the decode stage; they
+    // are only meaningful for instructions that read them.
+    output wire [ 4:0] o_retire_frs1_raddr,
+    output wire [31:0] o_retire_frs1_rdata,
+    output wire [ 4:0] o_retire_frs2_raddr,
+    output wire [31:0] o_retire_frs2_rdata,
+    output wire [ 4:0] o_retire_frs3_raddr,
+    output wire [31:0] o_retire_frs3_rdata,
+    // Asserted when the instruction being retired writes floating-point
+    // register `o_retire_frd_waddr` with `o_retire_frd_wdata`. (f0 is an
+    // ordinary register, so an enable is needed.)
+    output wire        o_retire_frd_wen,
+    output wire [ 4:0] o_retire_frd_waddr,
+    output wire [31:0] o_retire_frd_wdata,
+    // The accrued floating-point exception flags (fflags) after the
+    // instruction being retired.
+    output wire [ 4:0] o_retire_fflags
 
 `ifdef RISCV_FORMAL
     ,`RVFI_OUTPUTS,
@@ -119,6 +138,13 @@ module hart #(
   // IF reads through an instruction cache and MEM through a data cache. While
   // either one waits on main memory, every pipeline register holds
   // (phase_5.pdf 4.7).
+  // Phase 6: the fpu sits in EX beside the alu, and rf also holds f0-f31.
+  // A multi-cycle alu (mul/div) or fpu (fdiv/fsqrt) operation freezes the
+  // whole pipeline the same way a cache miss does (phase_6.pdf 5.5.2). FP
+  // results are not forwarded: an instruction that reads an FP register
+  // waits in ID until the writer reaches WB, where the rf bypass delivers it
+  // (phase_6.pdf 5.5.1). Integer results, including the fpu's, forward as
+  // before.
 
   // Bubbles are filled with addi x0, x0, 0 (phase_4.pdf 4.2.4).
   localparam [31:0] NOP = 32'h00000013;
@@ -130,13 +156,15 @@ module hart #(
   wire        id_halt;   // ebreak in ID: stop fetching behind it
   reg         halted;
   wire        freeze;    // a cache is waiting on memory: hold everything
+  wire        ex_stall;  // a multi-cycle alu/fpu op is running in EX
+  wire        pipe_stall = freeze | ex_stall;  // hold everything
 
   // ---------------- IF ----------------
   reg  [31:0] pc;
   always @(posedge i_clk) begin
     if (i_rst) begin
       pc <= RESET_ADDR;
-    end else if (freeze) begin
+    end else if (pipe_stall) begin
     end else if (redirect) begin
       pc <= redirect_pc;
     end else if (!stall && !id_halt && !halted) begin
@@ -186,7 +214,7 @@ module hart #(
       id_valid <= 1'b0;
       id_pc    <= 32'd0;
       id_inst  <= NOP;
-    end else if (freeze) begin
+    end else if (pipe_stall) begin
     end else if (redirect) begin
       id_valid <= 1'b0;
       id_inst  <= NOP;
@@ -222,11 +250,17 @@ module hart #(
   wire        dec_dmem_memh;
   wire        dec_dmem_memw;
   wire        dec_dmem_memu;
-  wire [ 3:0] dec_rd_sel;
+  wire [ 4:0] dec_rd_sel;
+  wire        dec_mext;
+  wire        dec_fpu;
+  wire        dec_frs1_en;
+  wire        dec_frs2_en;
+  wire        dec_frs3_en;
+  wire [ 4:0] dec_rs3;
+  wire        dec_frd_en;
   wire        dec_pc_sel;
   wire        dec_uses_rs1;
   wire        dec_uses_rs2;
-  wire        dec_is_load;
 
   decoder decoder_inst (
       .i_inst           (id_inst),
@@ -255,22 +289,41 @@ module hart #(
       .o_dmem_memw      (dec_dmem_memw),
       .o_dmem_memu      (dec_dmem_memu),
       .o_rd_sel         (dec_rd_sel),
+      .o_mext           (dec_mext),
+      .o_fpu            (dec_fpu),
+      .o_frs1_en        (dec_frs1_en),
+      .o_frs2_en        (dec_frs2_en),
+      .o_frs3_en        (dec_frs3_en),
+      .o_rs3            (dec_rs3),
+      .o_frd_en         (dec_frd_en),
       .o_pc_sel         (dec_pc_sel),
       .o_uses_rs1       (dec_uses_rs1),
-      .o_uses_rs2       (dec_uses_rs2),
-      .o_is_load        (dec_is_load)
+      .o_uses_rs2       (dec_uses_rs2)
   );
 
   // Only read (and report) source registers the instruction actually uses,
   // so immediate bits that look like a register can't cause a false stall.
+  // dec_uses_rs1/rs2 are the integer registers only: an F instruction that
+  // reads FP rs1 does not read x[rs1].
   wire [ 4:0] id_rs1 = dec_uses_rs1 ? dec_rs1 : 5'd0;
   wire [ 4:0] id_rs2 = dec_uses_rs2 ? dec_rs2 : 5'd0;
   wire [ 4:0] id_rd = dec_legal ? dec_rd : 5'd0;
   assign id_halt = id_valid & dec_halt;
 
+  // FP sources and destination. f0 is a real register, so these need their
+  // own enables instead of address 0 meaning "none".
+  wire        id_frs1_en = dec_legal & dec_frs1_en;
+  wire        id_frs2_en = dec_legal & dec_frs2_en;
+  wire        id_frs3_en = dec_legal & dec_frs3_en;
+  wire        id_frd_en = dec_legal & dec_frd_en;
+
   wire [31:0] rf_rs1_data, rf_rs2_data;
   wire [ 4:0] rf_rd_waddr;
   wire [31:0] rf_rd_wdata;
+  wire [31:0] rf_frs1_data, rf_frs2_data, rf_frs3_data;
+  wire        rf_frd_wen;
+  wire [ 4:0] rf_frd_waddr;
+  wire [31:0] rf_frd_wdata;
 
   rf #(
       .BYPASS_EN(BYPASS_EN)
@@ -282,7 +335,16 @@ module hart #(
       .i_rs2_raddr(id_rs2),
       .o_rs2_rdata(rf_rs2_data),
       .i_rd_waddr (rf_rd_waddr),
-      .i_rd_wdata (rf_rd_wdata)
+      .i_rd_wdata (rf_rd_wdata),
+      .i_frs1_raddr(dec_rs1),
+      .o_frs1_rdata(rf_frs1_data),
+      .i_frs2_raddr(dec_rs2),
+      .o_frs2_rdata(rf_frs2_data),
+      .i_frs3_raddr(dec_rs3),
+      .o_frs3_rdata(rf_frs3_data),
+      .i_frd_wen   (rf_frd_wen),
+      .i_frd_waddr (rf_frd_waddr),
+      .i_frd_wdata (rf_frd_wdata)
   );
 
   // ID/EX
@@ -316,7 +378,20 @@ module hart #(
   reg         ex_dmem_memh;
   reg         ex_dmem_memw;
   reg         ex_dmem_memu;
-  reg  [ 3:0] ex_rd_sel;
+  reg  [ 4:0] ex_rd_sel;
+  reg         ex_mext;
+  reg         ex_fpu;
+  reg         ex_frs1_en;
+  reg         ex_frs2_en;
+  reg         ex_frs3_en;
+  reg  [ 4:0] ex_frs1;
+  reg  [ 4:0] ex_frs2;
+  reg  [ 4:0] ex_frs3;
+  reg  [31:0] ex_frs1_data;
+  reg  [31:0] ex_frs2_data;
+  reg  [31:0] ex_frs3_data;
+  reg         ex_frd_en;
+  reg  [ 4:0] ex_frd;
 
   always @(posedge i_clk) begin
     if (i_rst) begin
@@ -328,7 +403,13 @@ module hart #(
       ex_is_load  <= 1'b0;
       ex_dmem_ren <= 1'b0;
       ex_dmem_wen <= 1'b0;
-    end else if (freeze) begin
+      ex_mext     <= 1'b0;
+      ex_fpu      <= 1'b0;
+      ex_frs1_en  <= 1'b0;
+      ex_frs2_en  <= 1'b0;
+      ex_frs3_en  <= 1'b0;
+      ex_frd_en   <= 1'b0;
+    end else if (pipe_stall) begin
     end else if (redirect || stall) begin
       ex_valid    <= 1'b0;
       ex_inst     <= NOP;
@@ -338,6 +419,12 @@ module hart #(
       ex_is_load  <= 1'b0;
       ex_dmem_ren <= 1'b0;
       ex_dmem_wen <= 1'b0;
+      ex_mext     <= 1'b0;
+      ex_fpu      <= 1'b0;
+      ex_frs1_en  <= 1'b0;
+      ex_frs2_en  <= 1'b0;
+      ex_frs3_en  <= 1'b0;
+      ex_frd_en   <= 1'b0;
     end else begin
       ex_valid         <= id_valid;
       ex_pc            <= id_pc;
@@ -361,7 +448,7 @@ module hart #(
       ex_branch_equal  <= dec_branch_equal;
       ex_branch_invert <= dec_branch_invert;
       ex_pc_sel        <= dec_pc_sel;
-      ex_is_load       <= dec_is_load;
+      ex_is_load       <= dec_dmem_ren;
       ex_dmem_ren      <= dec_dmem_ren;
       ex_dmem_wen      <= dec_dmem_wen;
       ex_dmem_align    <= dec_dmem_align;
@@ -370,6 +457,19 @@ module hart #(
       ex_dmem_memw     <= dec_dmem_memw;
       ex_dmem_memu     <= dec_dmem_memu;
       ex_rd_sel        <= dec_rd_sel;
+      ex_mext          <= dec_legal & dec_mext;
+      ex_fpu           <= dec_legal & dec_fpu;
+      ex_frs1_en       <= id_frs1_en;
+      ex_frs2_en       <= id_frs2_en;
+      ex_frs3_en       <= id_frs3_en;
+      ex_frs1          <= dec_rs1;
+      ex_frs2          <= dec_rs2;
+      ex_frs3          <= dec_rs3;
+      ex_frs1_data     <= rf_frs1_data;
+      ex_frs2_data     <= rf_frs2_data;
+      ex_frs3_data     <= rf_frs3_data;
+      ex_frd_en        <= id_valid & id_frd_en;
+      ex_frd           <= id_inst[11:7];  // dec_rd is 0 when rd is an FP register
     end
   end
 
@@ -379,9 +479,13 @@ module hart #(
   reg  [ 4:0] mem_rd;
   reg         mem_is_load;
   reg  [31:0] mem_result;
+  reg         mem_frd_en;
+  reg  [ 4:0] mem_frd;
   reg         wb_valid;
   reg  [ 4:0] wb_rd;
   reg  [31:0] wb_rd_wdata;
+  reg         wb_frd_en;
+  reg  [ 4:0] wb_frd;
 
   // Forwarding (FWD_EN): youngest producer wins, x0 is never forwarded.
   // A load in MEM can't be forwarded; the load-use stall keeps that from
@@ -400,17 +504,59 @@ module hart #(
   wire        alu_eq;
   wire        alu_slt;
 
+  wire        alu_busy;
+
+  // The instruction in EX moves to MEM at the next edge. The alu and fpu
+  // hold a finished multi-cycle result until then, and the fpu commits fcsr
+  // only then (phase_6.pdf 5.3.3, 5.5.3).
+  wire        ex_advance = ~pipe_stall;
+
   alu alu_inst (
+      .i_clk     (i_clk),
+      .i_rst     (i_rst),
       .i_opsel   (ex_alu_opsel),
       .i_sub     (ex_alu_sub),
       .i_unsigned(ex_alu_unsigned),
       .i_arith   (ex_alu_arith),
+      .i_mext    (ex_valid & ex_mext),
+      .i_advance (ex_advance),
       .i_op1     (alu_op1),
       .i_op2     (alu_op2),
       .o_result  (alu_result),
       .o_eq      (alu_eq),
-      .o_slt     (alu_slt)
+      .o_slt     (alu_slt),
+      .o_busy    (alu_busy)
   );
+
+  wire        fpu_valid = ex_valid & ex_fpu;
+  wire [31:0] fpu_fp_result;
+  wire [31:0] fpu_int_result;
+  wire [ 4:0] fpu_fflags;
+  wire        fpu_busy;
+  wire        fpu_rm_trap;
+
+  // FP operands come straight from the rf read in ID: the hazard check
+  // holds an FP reader in ID until its value is in the register file.
+  // i_xrs1 is the forwarded integer rs1 (fmv.w.x, fcvt.s.w[u], csrrw/s/c).
+  fpu fpu_inst (
+      .i_clk       (i_clk),
+      .i_rst       (i_rst),
+      .i_inst      (ex_inst),
+      .i_valid     (fpu_valid),
+      .i_advance   (ex_advance),
+      .i_frs1      (ex_frs1_data),
+      .i_frs2      (ex_frs2_data),
+      .i_frs3      (ex_frs3_data),
+      .i_xrs1      (ex_rs1_data),
+      .o_fp_result (fpu_fp_result),
+      .o_int_result(fpu_int_result),
+      .o_fflags    (fpu_fflags),
+      .o_busy      (fpu_busy),
+      .o_rm_trap   (fpu_rm_trap)
+  );
+
+  // Every stage holds while either unit is busy (phase_6.pdf 5.5.2).
+  assign ex_stall = ex_valid & (alu_busy | fpu_busy);
 
   wire        branch_cond = ex_branch_equal ? alu_eq : alu_slt;
   wire        branch_taken = ex_branch & (branch_cond ^ ex_branch_invert);
@@ -419,18 +565,24 @@ module hart #(
   wire [31:0] ex_pc_plus_4 = ex_pc + 32'd4;
   wire [31:0] ex_target = ex_pc_sel ? {alu_result[31:1], 1'b0} : ex_pc + ex_imm;
 
-  // Traps (phase_4.pdf 4.5.1): illegal encoding or misaligned load/store.
+  // Traps (phase_4.pdf 4.5.1): illegal encoding or misaligned load/store
+  // (flw/fsw included). Phase 6 adds a dynamic rounding mode while frm holds
+  // a reserved value, which only the fpu can see (phase_6.pdf 5.7.1).
   // A trap never redirects; the instruction just loses its side effects.
   wire [ 1:0] byte_offset = alu_result[1:0];
   wire        data_misaligned = (ex_dmem_ren | ex_dmem_wen) & |(byte_offset & ex_dmem_align);
-  wire        ex_trap = ex_illegal | data_misaligned;
+  wire        ex_trap = ex_illegal | data_misaligned | (fpu_valid & fpu_rm_trap);
 
   assign redirect = ex_valid & ex_take & ~ex_trap;
   assign redirect_pc = ex_target;
   wire [31:0] ex_next_pc = redirect ? ex_target : ex_pc_plus_4;
 
-  // Non-load writeback value, known by the end of EX.
-  wire [31:0] ex_result = ex_rd_sel[2] ? ex_pc_plus_4 : ex_rd_sel[1] ? ex_imm : alu_result;
+  // Non-load writeback value, known by the end of EX. rd_sel[4] is the
+  // fpu's integer result (compares, fclass, fmv.x.w, fcvt.w[u].s, old CSR
+  // value), which forwards like an alu result.
+  wire [31:0] ex_result = ex_rd_sel[4] ? fpu_int_result :
+                          ex_rd_sel[2] ? ex_pc_plus_4 :
+                          ex_rd_sel[1] ? ex_imm : alu_result;
 
   wire [ 3:0] byte_mask = (byte_offset == 2'd0) ? 4'b0001 :
                           (byte_offset == 2'd1) ? 4'b0010 :
@@ -440,10 +592,13 @@ module hart #(
                             ex_dmem_memh ? (byte_offset[1] ? 4'b1100 : 4'b0011) :
                             ex_dmem_memb ? byte_mask :
                                            4'b0000;
-  wire [31:0] store_data = (byte_offset == 2'd0) ? ex_rs2_data :
-                           (byte_offset == 2'd1) ? {ex_rs2_data[23:0], 8'b0} :
-                           (byte_offset == 2'd2) ? {ex_rs2_data[15:0], 16'b0} :
-                                                   {ex_rs2_data[7:0], 24'b0};
+  // fsw stores FP rs2 instead of x[rs2]. It is a word access, so it is
+  // never shifted (a misaligned one traps).
+  wire [31:0] store_src = ex_frs2_en ? ex_frs2_data : ex_rs2_data;
+  wire [31:0] store_data = (byte_offset == 2'd0) ? store_src :
+                           (byte_offset == 2'd1) ? {store_src[23:0], 8'b0} :
+                           (byte_offset == 2'd2) ? {store_src[15:0], 16'b0} :
+                                                   {store_src[7:0], 24'b0};
 
   // EX/MEM
   reg  [31:0] mem_pc;
@@ -464,21 +619,34 @@ module hart #(
   reg         mem_memb;
   reg         mem_memh;
   reg         mem_memu;
+  reg  [31:0] mem_fresult;
+  reg         mem_frs1_en;
+  reg         mem_frs2_en;
+  reg         mem_frs3_en;
+  reg  [ 4:0] mem_frs1;
+  reg  [ 4:0] mem_frs2;
+  reg  [ 4:0] mem_frs3;
+  reg  [31:0] mem_frs1_data;
+  reg  [31:0] mem_frs2_data;
+  reg  [31:0] mem_frs3_data;
+  reg  [ 4:0] mem_fflags;
 
   always @(posedge i_clk) begin
     if (i_rst) begin
-      mem_valid <= 1'b0;
-      mem_inst  <= NOP;
-      mem_rd    <= 5'd0;
-      mem_ren   <= 1'b0;
-      mem_wen   <= 1'b0;
-    end else if (freeze) begin
+      mem_valid  <= 1'b0;
+      mem_inst   <= NOP;
+      mem_rd     <= 5'd0;
+      mem_ren    <= 1'b0;
+      mem_wen    <= 1'b0;
+      mem_frd_en <= 1'b0;
+    end else if (pipe_stall) begin
     end else if (!ex_valid) begin
-      mem_valid <= 1'b0;
-      mem_inst  <= NOP;
-      mem_rd    <= 5'd0;
-      mem_ren   <= 1'b0;
-      mem_wen   <= 1'b0;
+      mem_valid  <= 1'b0;
+      mem_inst   <= NOP;
+      mem_rd     <= 5'd0;
+      mem_ren    <= 1'b0;
+      mem_wen    <= 1'b0;
+      mem_frd_en <= 1'b0;
     end else begin
       mem_valid    <= 1'b1;
       mem_pc       <= ex_pc;
@@ -502,14 +670,29 @@ module hart #(
       mem_memb     <= ex_dmem_memb;
       mem_memh     <= ex_dmem_memh;
       mem_memu     <= ex_dmem_memu;
+      mem_frd_en   <= ex_frd_en & ~ex_trap;
+      mem_frd      <= ex_frd;
+      mem_fresult  <= fpu_fp_result;
+      mem_frs1_en  <= ex_frs1_en;
+      mem_frs2_en  <= ex_frs2_en;
+      mem_frs3_en  <= ex_frs3_en;
+      mem_frs1     <= ex_frs1;
+      mem_frs2     <= ex_frs2;
+      mem_frs3     <= ex_frs3;
+      mem_frs1_data <= ex_frs1_data;
+      mem_frs2_data <= ex_frs2_data;
+      mem_frs3_data <= ex_frs3_data;
+      mem_fflags   <= fpu_fflags;
     end
   end
 
   // ---------------- MEM ----------------
   // Trapped loads and stores were already dropped in EX, so they never reach
-  // the cache (phase_5.pdf 4.10.1).
-  wire        dcache_ren = mem_valid & mem_ren;
-  wire        dcache_wen = mem_valid & mem_wen;
+  // the cache (phase_5.pdf 4.10.1). While a multi-cycle op holds EX, the
+  // access in MEM waits and is made once, after it (phase_6.pdf 5.5.3);
+  // otherwise a store would be written on every held cycle.
+  wire        dcache_ren = mem_valid & mem_ren & ~ex_stall;
+  wire        dcache_wen = mem_valid & mem_wen & ~ex_stall;
   wire        dcache_ready;
   wire [31:0] dcache_rdata;
 
@@ -550,6 +733,8 @@ module hart #(
       mem_memh ? {{16{~mem_memu & load_shifted[15]}}, load_shifted[15:0]} :
                  dcache_rdata;
   wire [31:0] mem_rd_wdata = mem_is_load ? load_data : mem_result;
+  // flw loads the full word into an FP register.
+  wire [31:0] mem_frd_wdata = mem_is_load ? dcache_rdata : mem_fresult;
 
   // MEM/WB
   reg  [31:0] wb_pc;
@@ -567,17 +752,30 @@ module hart #(
   reg         wb_dmem_wen;
   reg  [31:0] wb_dmem_rdata;
   reg  [31:0] wb_dmem_wdata;
+  reg  [31:0] wb_frd_wdata;
+  reg         wb_frs1_en;
+  reg         wb_frs2_en;
+  reg         wb_frs3_en;
+  reg  [ 4:0] wb_frs1;
+  reg  [ 4:0] wb_frs2;
+  reg  [ 4:0] wb_frs3;
+  reg  [31:0] wb_frs1_data;
+  reg  [31:0] wb_frs2_data;
+  reg  [31:0] wb_frs3_data;
+  reg  [ 4:0] wb_fflags;
 
   always @(posedge i_clk) begin
     if (i_rst) begin
-      wb_valid <= 1'b0;
-      wb_inst  <= NOP;
-      wb_rd    <= 5'd0;
-    end else if (freeze) begin
+      wb_valid  <= 1'b0;
+      wb_inst   <= NOP;
+      wb_rd     <= 5'd0;
+      wb_frd_en <= 1'b0;
+    end else if (pipe_stall) begin
     end else if (!mem_valid) begin
-      wb_valid <= 1'b0;
-      wb_inst  <= NOP;
-      wb_rd    <= 5'd0;
+      wb_valid  <= 1'b0;
+      wb_inst   <= NOP;
+      wb_rd     <= 5'd0;
+      wb_frd_en <= 1'b0;
     end else begin
       wb_valid      <= 1'b1;
       wb_pc         <= mem_pc;
@@ -597,24 +795,40 @@ module hart #(
       wb_dmem_wen   <= mem_wen;
       wb_dmem_rdata <= dcache_rdata;
       wb_dmem_wdata <= mem_wdata;
+      wb_frd_en     <= mem_frd_en;
+      wb_frd        <= mem_frd;
+      wb_frd_wdata  <= mem_frd_wdata;
+      wb_frs1_en    <= mem_frs1_en;
+      wb_frs2_en    <= mem_frs2_en;
+      wb_frs3_en    <= mem_frs3_en;
+      wb_frs1       <= mem_frs1;
+      wb_frs2       <= mem_frs2;
+      wb_frs3       <= mem_frs3;
+      wb_frs1_data  <= mem_frs1_data;
+      wb_frs2_data  <= mem_frs2_data;
+      wb_frs3_data  <= mem_frs3_data;
+      wb_fflags     <= mem_fflags;
     end
   end
 
   // ---------------- WB ----------------
-  // WB keeps its instruction through a freeze but retires it only once, in
-  // the first cycle.
+  // WB keeps its instruction through a freeze or EX stall but retires it
+  // only once, in the first cycle.
   reg         wb_done;
   always @(posedge i_clk) begin
     if (i_rst) begin
       wb_done <= 1'b0;
     end else begin
-      wb_done <= freeze;
+      wb_done <= pipe_stall;
     end
   end
   wire        wb_retire = wb_valid & ~wb_done;
 
   assign rf_rd_waddr = wb_retire ? wb_rd : 5'd0;
   assign rf_rd_wdata = wb_rd_wdata;
+  assign rf_frd_wen = wb_retire & wb_frd_en;
+  assign rf_frd_waddr = wb_frd;
+  assign rf_frd_wdata = wb_frd_wdata;
 
   // ---------------- Hazard detection (ID) ----------------
   // An older instruction in stage S writes a register the ID instruction reads.
@@ -627,13 +841,31 @@ module hart #(
   wire wb_stall = !BYPASS_EN && hz_wb;
   wire raw_stall = FWD_EN ? (hz_ex && ex_is_load) || wb_stall : hz_ex || hz_mem || wb_stall;
 
-  assign stall = id_valid && raw_stall;
+  // FP registers are never forwarded (phase_6.pdf 5.5.1): an FP reader waits
+  // until the writer is in WB, where the rf bypass delivers it (one cycle
+  // later without the bypass). This covers FP RAW, flw load-use, fsw's data
+  // register and rs3. Register numbers only match within the same file.
+  wire fhz_ex = ex_valid && ex_frd_en &&
+                ((id_frs1_en && ex_frd == dec_rs1) ||
+                 (id_frs2_en && ex_frd == dec_rs2) ||
+                 (id_frs3_en && ex_frd == dec_rs3));
+  wire fhz_mem = mem_valid && mem_frd_en &&
+                 ((id_frs1_en && mem_frd == dec_rs1) ||
+                  (id_frs2_en && mem_frd == dec_rs2) ||
+                  (id_frs3_en && mem_frd == dec_rs3));
+  wire fhz_wb = wb_retire && wb_frd_en &&
+                ((id_frs1_en && wb_frd == dec_rs1) ||
+                 (id_frs2_en && wb_frd == dec_rs2) ||
+                 (id_frs3_en && wb_frd == dec_rs3));
+  wire fp_stall = fhz_ex || fhz_mem || (!BYPASS_EN && fhz_wb);
+
+  assign stall = id_valid && (raw_stall || fp_stall);
 
   // Once an ebreak leaves ID, nothing behind it is fetched.
   always @(posedge i_clk) begin
     if (i_rst) begin
       halted <= 1'b0;
-    end else if (id_halt && !stall && !redirect && !freeze) begin
+    end else if (id_halt && !stall && !redirect && !pipe_stall) begin
       halted <= 1'b1;
     end
   end
@@ -657,6 +889,16 @@ module hart #(
   assign o_retire_dmem_wdata = wb_dmem_wdata;
   assign o_retire_pc         = wb_pc;
   assign o_retire_next_pc    = wb_next_pc;
+  assign o_retire_frs1_raddr = wb_frs1_en ? wb_frs1 : 5'd0;
+  assign o_retire_frs1_rdata = wb_frs1_en ? wb_frs1_data : 32'd0;
+  assign o_retire_frs2_raddr = wb_frs2_en ? wb_frs2 : 5'd0;
+  assign o_retire_frs2_rdata = wb_frs2_en ? wb_frs2_data : 32'd0;
+  assign o_retire_frs3_raddr = wb_frs3_en ? wb_frs3 : 5'd0;
+  assign o_retire_frs3_rdata = wb_frs3_en ? wb_frs3_data : 32'd0;
+  assign o_retire_frd_wen    = wb_frd_en;
+  assign o_retire_frd_waddr  = wb_frd_en ? wb_frd : 5'd0;
+  assign o_retire_frd_wdata  = wb_frd_wdata;
+  assign o_retire_fflags     = wb_fflags;
 
 endmodule
 
