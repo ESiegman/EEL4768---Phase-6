@@ -1,45 +1,47 @@
-// Carried over from phase 5, where it was shared by the five hart cache
-// configuration testbenches. Not yet updated for phase 6: it knows nothing
-// about the FP retire ports, and MEM_WORDS is still phase 5's 64 KB while
-// phase 6's random_dmem.hex is 32768 words (128 KB).
-//
-// Harness shared by the five hart testbenches (hart_*_tb.v): one hart with a
-// given cache configuration and memory latency, its instruction and data
-// main memories, and every check that runs on it. Each hart_*_tb.v
-// instantiates one harness per configuration/latency pair and starts them
-// one after another, so the log reads in order.
+// Harness shared by the eight phase 6 hart testbenches (hart_*_tb.v): one
+// hart with a given cache configuration and memory latency, its instruction
+// and data main memories, and every check that runs on it. A hart_*_tb.v
+// instantiates one harness per configuration and starts them one after
+// another, so the log reads in order.
 //
 // A .vh, not a .v, for the same reason as mem_model.vh: run_test.sh would
-// otherwise compile it into every check and lint it as a design file.
+// otherwise compile it into every check and `ece552 validate` would lint it
+// as a design file (it uses loops, file I/O and delays).
 //
 // A harness resets the hart, runs traces/random_program.hex until the final
 // ebreak retires, then checks:
-//  * The run itself: it halts within MAX_CYCLES, with no gap of IDLE_LIMIT
-//    cycles between two retirements. On a timeout it prints the last
-//    retired PC.
-//  * The retire stream, against a shadow data memory that starts at all
-//    zeros and takes every retiring store. This is the main checker: the
-//    dcache is write-back, so main memory is stale for dirty lines at halt.
-//      - every retiring load's o_retire_dmem_rdata (the full word the dcache
-//        returned) equals the shadow word before that load
-//      - o_retire_inst is the program word at o_retire_pc (the icache)
-//      - o_retire_pc starts at RESET_ADDR and each one equals the previous
-//        o_retire_next_pc; next_pc is pc + 4 except for branches and jumps
-//      - no traps (the trace has none)
-//      - the dmem mask fits the instruction and the address is in data
-//        memory; a load's rd value is the right lanes of rdata, sign or zero
-//        extended, and a store's wdata holds rs2 in the masked lanes
-//  * After halt, the shadow memory equals traces/random_dmem.hex.
-//  * Main memory after halt. Words that differ from random_dmem.hex are
-//    only legal inside lines the dcache still holds dirty. Without access to
-//    the dcache's storage this cannot be checked word by word, so the count
-//    is reported, and it is a failure only if more lines differ than the
-//    dcache has. With HART_TB_PEEK_DCACHE defined (see below) the dirty
-//    lines are read out of dut.dcache and overlaid, and the result must
-//    match exactly.
-//  * The memory models saw no protocol errors (mem_model.vh).
-// It then prints cycles, instructions retired, CPI and memory traffic, which
-// also catches a cache that "passes" by never hitting.
+//  * The run: it halts within MAX_CYCLES, with no gap of IDLE_LIMIT cycles
+//    between two retirements, and the program fits in instruction memory.
+//  * The retire stream (phase_6.pdf 5.7). These checks find hazard,
+//    forwarding, stall and fcsr-commit bugs whether or not the FP math is
+//    right, because they only compare the hart with itself:
+//      - shadow integer and FP register files, updated from every retiring
+//        rd/frd write (FP registers reset to +0.0, f0 is an ordinary
+//        register). Every integer source a retiring instruction reports, and
+//        every FP source it reads (decoded here from the PDF 5.5 table),
+//        must equal the shadow value
+//      - FP destinations: an instruction that writes an FP register reports
+//        frd_wen with frd = inst[11:7] and no integer rd; nothing else
+//        reports frd_wen
+//      - a shadow fcsr. fflags reported by an F instruction (flw, fsw,
+//        OP-FP, fused, CSR) may only gain bits, and only on instructions
+//        that can raise flags; a CSR instruction's rd must be the old CSR
+//        value and its fflags the value it writes (PDF 4.6.2). A dynamic-rm
+//        instruction must trap exactly when the shadow frm is 5-7
+//      - loads: the dcache word equals a shadow data memory built from the
+//        retiring stores; lw/lh/lb/flw take the right lanes, and flw writes
+//        the whole word to frd
+//      - stores: the masked lanes hold rs2, or frs2 for fsw
+//      - the instruction word matches the program, the PC sequence follows
+//        next_pc, and nothing traps (the trace has no traps)
+//  * Memory, after halt. The program ends with loads that evict every dirty
+//    dcache line (phase_6.pdf 6.1), so main memory must equal the shadow
+//    memory everywhere. The section verdict is that both equal
+//    traces/random_dmem.hex in [SEC_LO, SEC_HI]. The diff counts of every
+//    other region are printed as INFO lines.
+//  * The memory models saw no protocol errors (mem_model.vh), and the dcache
+//    saw no request while dut.ex_stall was high (phase_6.pdf 5.5.3).
+// It then prints cycles, instructions retired, CPI and memory traffic.
 
 `ifndef HART_TB_COMMON_VH
 `define HART_TB_COMMON_VH
@@ -48,18 +50,22 @@
 
 module hart_harness #(
     // Printed in front of every message from this instance.
-    parameter LABEL        = "base, L=4",
-    parameter EVICT_POLICY = 0,
-    parameter NUM_WAYS     = 128,
-    parameter CACHE_SIZE   = 16,
-    parameter BLOCK_SIZE   = 128,
-    parameter PREFETCH_EN  = 0,
+    parameter LABEL        = "hart",
+    parameter EVICT_POLICY = 1,
+    parameter NUM_WAYS     = 4,
+    parameter CACHE_SIZE   = 2,
+    parameter BLOCK_SIZE   = 16,
+    parameter PREFETCH_EN  = 1,
     // Main memory read latency in cycles, for both memories.
     parameter LATENCY      = 4,
+    // The register dump range this check is graded on (phase_6.pdf 6.1),
+    // inclusive byte addresses.
+    parameter [31:0] SEC_LO = 32'h10020000,
+    parameter [31:0] SEC_HI = 32'h100217FF,
     // Watchdogs: give up after this many cycles in total, or after this many
     // cycles in a row without a retirement.
-    parameter MAX_CYCLES   = 600000,
-    parameter IDLE_LIMIT   = 2000
+    parameter MAX_CYCLES   = 2000000,
+    parameter IDLE_LIMIT   = 3000
 ) (
     input  wire i_start,
     output reg  o_done
@@ -67,14 +73,16 @@ module hart_harness #(
 
     localparam [31:0] IMEM_BASE   = 32'h00400000;
     localparam [31:0] DMEM_BASE   = 32'h10010000;
-    localparam        MEM_WORDS   = 16384;  // 64 KB each, as in phase_5.pdf 4.6
+    // random_program.hex is 36088 words, so the instruction memory has room
+    // to spare; random_dmem.hex is 32768 words (128 KB).
+    localparam        IMEM_WORDS  = 40000;
+    localparam        DMEM_WORDS  = 32768;
     // One spare block past the end of each memory, so a next-line prefetch
     // after a miss on the last line is still a legal read. Nothing should
     // ever write it.
     localparam        GUARD_WORDS = BLOCK_SIZE / 4;
-    localparam        NUM_LINES   = CACHE_SIZE * 1024 / BLOCK_SIZE;
-    localparam        LINE_WORDS  = BLOCK_SIZE / 4;
     localparam        MAX_MSGS    = 20;
+    localparam        N_REGIONS   = 12;
 
     // Results, read by the top-level testbench.
     integer passed;
@@ -123,6 +131,16 @@ module hart_harness #(
     wire [31:0] retire_dmem_wdata;
     wire [31:0] retire_pc;
     wire [31:0] retire_next_pc;
+    wire [ 4:0] retire_frs1_raddr;
+    wire [31:0] retire_frs1_rdata;
+    wire [ 4:0] retire_frs2_raddr;
+    wire [31:0] retire_frs2_rdata;
+    wire [ 4:0] retire_frs3_raddr;
+    wire [31:0] retire_frs3_rdata;
+    wire        retire_frd_wen;
+    wire [ 4:0] retire_frd_waddr;
+    wire [31:0] retire_frd_wdata;
+    wire [ 4:0] retire_fflags;
 
     hart #(
         .RESET_ADDR  (IMEM_BASE),
@@ -163,7 +181,17 @@ module hart_harness #(
         .o_retire_dmem_rdata(retire_dmem_rdata),
         .o_retire_dmem_wdata(retire_dmem_wdata),
         .o_retire_pc        (retire_pc),
-        .o_retire_next_pc   (retire_next_pc)
+        .o_retire_next_pc   (retire_next_pc),
+        .o_retire_frs1_raddr(retire_frs1_raddr),
+        .o_retire_frs1_rdata(retire_frs1_rdata),
+        .o_retire_frs2_raddr(retire_frs2_raddr),
+        .o_retire_frs2_rdata(retire_frs2_rdata),
+        .o_retire_frs3_raddr(retire_frs3_raddr),
+        .o_retire_frs3_rdata(retire_frs3_rdata),
+        .o_retire_frd_wen   (retire_frd_wen),
+        .o_retire_frd_waddr (retire_frd_waddr),
+        .o_retire_frd_wdata (retire_frd_wdata),
+        .o_retire_fflags    (retire_fflags)
     );
 
     // Instruction memory is read only: its write port is tied off.
@@ -171,7 +199,7 @@ module hart_harness #(
         .BLOCK_SIZE(BLOCK_SIZE),
         .LATENCY   (LATENCY),
         .BASE_ADDR (IMEM_BASE),
-        .SIZE_WORDS(MEM_WORDS + GUARD_WORDS),
+        .SIZE_WORDS(IMEM_WORDS + GUARD_WORDS),
         .NAME      ({LABEL, ", imem"})
     ) u_imem (
         .i_clk     (clk),
@@ -190,7 +218,7 @@ module hart_harness #(
         .BLOCK_SIZE(BLOCK_SIZE),
         .LATENCY   (LATENCY),
         .BASE_ADDR (DMEM_BASE),
-        .SIZE_WORDS(MEM_WORDS + GUARD_WORDS),
+        .SIZE_WORDS(DMEM_WORDS + GUARD_WORDS),
         .NAME      ({LABEL, ", dmem"})
     ) u_dmem (
         .i_clk     (clk),
@@ -227,7 +255,14 @@ module hart_harness #(
     integer bad_inst;     // instruction word from the icache
     integer bad_pc;       // retire PC sequence
     integer bad_lane;     // dmem mask/address/lane formatting
+    integer bad_xsrc;     // integer source vs the shadow register file
+    integer bad_fsrc;     // FP source vs the shadow FP register file
+    integer bad_dst;      // rd/frd reporting of F instructions
+    integer bad_flags;    // fflags vs the shadow fcsr
+    integer bad_csr;      // CSR instruction rd (old value)
+    integer bad_rmtrap;   // dynamic-rm trap vs the shadow frm
     integer n_traps;
+    integer dstall_errs;  // dcache requests while ex_stall was high
     integer msgs;
 
     integer cycles;       // cycles since reset was released
@@ -235,18 +270,24 @@ module hart_harness #(
     integer retired;
     integer n_loads;
     integer n_stores;
+    integer n_fp;         // F and CSR instructions retired
+    integer n_csr;
     integer prog_words;
     reg     halted;
     reg     have_prev;
     reg [31:0] prev_next_pc;
     reg [31:0] last_pc;
 
-    reg [31:0] shadow [0:MEM_WORDS-1];
-    reg [31:0] golden [0:MEM_WORDS-1];
+    reg [31:0] shadow [0:DMEM_WORDS-1];
+    reg [31:0] golden [0:DMEM_WORDS-1];
+    reg [31:0] xs [0:31];     // shadow integer registers
+    reg [31:0] fs [0:31];     // shadow FP registers
+    reg [ 4:0] sh_fflags;     // shadow fcsr
+    reg [ 2:0] sh_frm;
 
     // Prints one retire-stream mismatch (the first MAX_MSGS of them).
     task report;
-        input [8*40-1:0] what;
+        input [8*64-1:0] what;
         input [31:0]     got;
         input [31:0]     want;
         begin
@@ -292,12 +333,43 @@ module hart_harness #(
         end
     endfunction
 
+    // The dcache must not see a request while a multi-cycle operation holds
+    // EX (phase_6.pdf 5.5.3). Same assertion as tools/hart_diff/hart_diff_tb.v.
+    always @(posedge clk) begin
+        if (running && rst === 1'b0 && dut.ex_stall === 1'b1 &&
+            (dut.dcache_ren === 1'b1 || dut.dcache_wen === 1'b1)) begin
+            if (dstall_errs < MAX_MSGS)
+                $display("[FAIL] %0s: dcache request during ex_stall at cycle %0d (ren %b, wen %b)",
+                         LABEL, cycles, dut.dcache_ren, dut.dcache_wen);
+            dstall_errs = dstall_errs + 1;
+        end
+    end
+
     reg  [31:0] widx;
     reg  [31:0] want;
     reg  [31:0] lanes;
+    reg  [31:0] st_src;
     reg  [ 2:0] funct3;
     reg  [ 6:0] opcode;
+    reg  [ 6:0] funct7;
+    reg  [ 4:0] f_rd, f_rs1, f_rs2, f_rs3;
     integer     b;
+
+    // Decoded classes of the retiring instruction (phase_6.pdf 4.7, 5.5).
+    reg is_flw, is_fsw, is_fma, is_opfp, is_csr, is_f;
+    reg rd_f1, rd_f2, rd_f3;      // reads FP rs1/rs2/rs3
+    reg wr_f;                     // writes an FP register
+    reg wr_x_fpu;                 // FPU instruction that writes an integer rd
+    reg can_flag;                 // can raise exception flags
+    reg uses_rm;                  // has a rounding-mode field
+
+    // CSR model.
+    reg  [ 7:0] csr_old;
+    reg  [ 7:0] csr_src;
+    reg  [ 7:0] csr_new;
+    reg         csr_wr;
+    reg  [ 4:0] ff_after;
+    reg  [ 2:0] frm_after;
 
     // Retire monitor, sampled mid-cycle while the outputs are stable.
     always @(negedge clk) begin
@@ -310,9 +382,45 @@ module hart_harness #(
                 last_pc = retire_pc;
                 opcode  = retire_inst[6:0];
                 funct3  = retire_inst[14:12];
+                funct7  = retire_inst[31:25];
+                f_rd    = retire_inst[11:7];
+                f_rs1   = retire_inst[19:15];
+                f_rs2   = retire_inst[24:20];
+                f_rs3   = retire_inst[31:27];
+
+                is_flw  = (opcode == 7'b0000111);
+                is_fsw  = (opcode == 7'b0100111);
+                is_fma  = (opcode == 7'b1000011) || (opcode == 7'b1000111) ||
+                          (opcode == 7'b1001011) || (opcode == 7'b1001111);
+                is_opfp = (opcode == 7'b1010011);
+                is_csr  = (opcode == 7'b1110011) && (funct3 != 3'b000);
+                is_f    = is_flw || is_fsw || is_fma || is_opfp || is_csr;
+                // OP-FP by funct7: 00 fadd, 04 fsub, 08 fmul, 0C fdiv,
+                // 2C fsqrt, 10 fsgnj*, 14 fmin/fmax, 50 compares,
+                // 60 fcvt.w[u].s, 68 fcvt.s.w[u], 70 fmv.x.w/fclass,
+                // 78 fmv.w.x.
+                rd_f1    = is_fma || (is_opfp && funct7 != 7'h68 && funct7 != 7'h78);
+                rd_f2    = is_fsw || is_fma ||
+                           (is_opfp && (funct7 == 7'h00 || funct7 == 7'h04 ||
+                                        funct7 == 7'h08 || funct7 == 7'h0C ||
+                                        funct7 == 7'h10 || funct7 == 7'h14 ||
+                                        funct7 == 7'h50));
+                rd_f3    = is_fma;
+                wr_x_fpu = is_csr ||
+                           (is_opfp && (funct7 == 7'h50 || funct7 == 7'h60 || funct7 == 7'h70));
+                wr_f     = is_flw || is_fma || (is_opfp && !wr_x_fpu);
+                can_flag = is_fma ||
+                           (is_opfp && funct7 != 7'h10 && funct7 != 7'h70 && funct7 != 7'h78);
+                uses_rm  = is_fma ||
+                           (is_opfp && (funct7 == 7'h00 || funct7 == 7'h04 ||
+                                        funct7 == 7'h08 || funct7 == 7'h0C ||
+                                        funct7 == 7'h2C || funct7 == 7'h60 ||
+                                        funct7 == 7'h68));
+                if (is_f)
+                    n_fp = n_fp + 1;
 
                 // Instruction word, from the icache.
-                if (retire_pc < IMEM_BASE || retire_pc >= IMEM_BASE + 4 * MEM_WORDS ||
+                if (retire_pc < IMEM_BASE || retire_pc >= IMEM_BASE + 4 * IMEM_WORDS ||
                     retire_pc[1:0] != 2'b00) begin
                     bad_pc = bad_pc + 1;
                     report("retire PC outside instruction memory", retire_pc, IMEM_BASE);
@@ -339,9 +447,130 @@ module hart_harness #(
                 have_prev    = 1'b1;
                 prev_next_pc = retire_next_pc;
 
+                // Integer sources: whatever the hart reports reading must be
+                // the value the shadow register file holds (x0 reads 0).
+                if (retire_rs1_raddr !== 5'd0) begin
+                    if (retire_rs1_raddr !== f_rs1) begin
+                        bad_xsrc = bad_xsrc + 1;
+                        report("rs1 address vs inst[19:15]", {27'd0, retire_rs1_raddr}, {27'd0, f_rs1});
+                    end else if (retire_rs1_rdata !== xs[f_rs1]) begin
+                        bad_xsrc = bad_xsrc + 1;
+                        report("rs1 value vs shadow register", retire_rs1_rdata, xs[f_rs1]);
+                    end
+                end
+                if (retire_rs2_raddr !== 5'd0) begin
+                    if (retire_rs2_raddr !== f_rs2) begin
+                        bad_xsrc = bad_xsrc + 1;
+                        report("rs2 address vs inst[24:20]", {27'd0, retire_rs2_raddr}, {27'd0, f_rs2});
+                    end else if (retire_rs2_rdata !== xs[f_rs2]) begin
+                        bad_xsrc = bad_xsrc + 1;
+                        report("rs2 value vs shadow register", retire_rs2_rdata, xs[f_rs2]);
+                    end
+                end
+
                 if (retire_trap === 1'b1) begin
                     n_traps = n_traps + 1;
                     report("unexpected trap", {31'd0, retire_trap}, 32'd0);
+                end
+
+                // Dynamic rounding mode: traps exactly when frm is 5-7.
+                if (uses_rm && funct3 == 3'b111 &&
+                    (retire_trap === 1'b1) !== (sh_frm >= 3'd5)) begin
+                    bad_rmtrap = bad_rmtrap + 1;
+                    report("dynamic-rm trap vs shadow frm", {31'd0, retire_trap}, {29'd0, sh_frm});
+                end
+
+                // FP sources, for the operands the instruction reads.
+                if (retire_trap !== 1'b1) begin
+                    if (rd_f1 && (retire_frs1_raddr !== f_rs1 || retire_frs1_rdata !== fs[f_rs1])) begin
+                        bad_fsrc = bad_fsrc + 1;
+                        report(retire_frs1_raddr !== f_rs1 ? "frs1 address vs inst[19:15]"
+                                                           : "frs1 value vs shadow FP register",
+                               retire_frs1_raddr !== f_rs1 ? {27'd0, retire_frs1_raddr} : retire_frs1_rdata,
+                               retire_frs1_raddr !== f_rs1 ? {27'd0, f_rs1} : fs[f_rs1]);
+                    end
+                    if (rd_f2 && (retire_frs2_raddr !== f_rs2 || retire_frs2_rdata !== fs[f_rs2])) begin
+                        bad_fsrc = bad_fsrc + 1;
+                        report(retire_frs2_raddr !== f_rs2 ? "frs2 address vs inst[24:20]"
+                                                           : "frs2 value vs shadow FP register",
+                               retire_frs2_raddr !== f_rs2 ? {27'd0, retire_frs2_raddr} : retire_frs2_rdata,
+                               retire_frs2_raddr !== f_rs2 ? {27'd0, f_rs2} : fs[f_rs2]);
+                    end
+                    if (rd_f3 && (retire_frs3_raddr !== f_rs3 || retire_frs3_rdata !== fs[f_rs3])) begin
+                        bad_fsrc = bad_fsrc + 1;
+                        report(retire_frs3_raddr !== f_rs3 ? "frs3 address vs inst[31:27]"
+                                                           : "frs3 value vs shadow FP register",
+                               retire_frs3_raddr !== f_rs3 ? {27'd0, retire_frs3_raddr} : retire_frs3_rdata,
+                               retire_frs3_raddr !== f_rs3 ? {27'd0, f_rs3} : fs[f_rs3]);
+                    end
+
+                    // Destinations of F instructions.
+                    if (wr_f) begin
+                        if (retire_frd_wen !== 1'b1 || retire_frd_waddr !== f_rd) begin
+                            bad_dst = bad_dst + 1;
+                            report("frd_wen/frd vs inst[11:7]", {26'd0, retire_frd_wen, retire_frd_waddr},
+                                   {26'd0, 1'b1, f_rd});
+                        end
+                        if (retire_rd_waddr !== 5'd0) begin
+                            bad_dst = bad_dst + 1;
+                            report("integer rd of an FP-writing instruction", {27'd0, retire_rd_waddr}, 32'd0);
+                        end
+                    end else if (retire_frd_wen !== 1'b0) begin
+                        bad_dst = bad_dst + 1;
+                        report("frd_wen of an instruction that writes no FP register",
+                               {31'd0, retire_frd_wen}, 32'd0);
+                    end
+                    if (wr_x_fpu && retire_rd_waddr !== f_rd) begin
+                        bad_dst = bad_dst + 1;
+                        report("integer rd vs inst[11:7]", {27'd0, retire_rd_waddr}, {27'd0, f_rd});
+                    end
+                end else if (retire_frd_wen !== 1'b0 || retire_rd_waddr !== 5'd0) begin
+                    bad_dst = bad_dst + 1;
+                    report("trapped instruction writes a register", {27'd0, retire_rd_waddr}, 32'd0);
+                end
+
+                // fcsr. Only F instructions report fflags (phase_6.pdf 5.7).
+                if (is_f) begin
+                    if (retire_trap === 1'b1) begin
+                        if (retire_fflags !== sh_fflags) begin
+                            bad_flags = bad_flags + 1;
+                            report("fflags changed by a trapped instruction",
+                                   {27'd0, retire_fflags}, {27'd0, sh_fflags});
+                        end
+                    end else if (is_csr) begin
+                        n_csr   = n_csr + 1;
+                        csr_old = (retire_inst[21:20] == 2'b01) ? {3'd0, sh_fflags} :
+                                  (retire_inst[21:20] == 2'b10) ? {5'd0, sh_frm} :
+                                                                  {sh_frm, sh_fflags};
+                        csr_src = funct3[2] ? {3'd0, f_rs1} : xs[f_rs1][7:0];
+                        csr_new = (funct3[1:0] == 2'b01) ? csr_src :
+                                  (funct3[1:0] == 2'b10) ? (csr_old | csr_src) :
+                                                           (csr_old & ~csr_src);
+                        csr_wr  = (funct3[1:0] == 2'b01) || (f_rs1 != 5'd0);
+                        ff_after  = (csr_wr && retire_inst[21:20] != 2'b10) ? csr_new[4:0] : sh_fflags;
+                        frm_after = (csr_wr && retire_inst[21:20] == 2'b10) ? csr_new[2:0] :
+                                    (csr_wr && retire_inst[21:20] == 2'b11) ? csr_new[7:5] : sh_frm;
+                        if (retire_rd_waddr !== 5'd0 && retire_rd_wdata !== {24'd0, csr_old}) begin
+                            bad_csr = bad_csr + 1;
+                            report("CSR rd (old value) vs shadow fcsr", retire_rd_wdata, {24'd0, csr_old});
+                        end
+                        if (retire_fflags !== ff_after) begin
+                            bad_flags = bad_flags + 1;
+                            report("fflags after a CSR instruction", {27'd0, retire_fflags}, {27'd0, ff_after});
+                        end
+                        sh_fflags = ff_after;
+                        sh_frm    = frm_after;
+                    end else if (can_flag) begin
+                        if ((retire_fflags & sh_fflags) !== sh_fflags) begin
+                            bad_flags = bad_flags + 1;
+                            report("fflags lost a bit (flags accrue)", {27'd0, retire_fflags}, {27'd0, sh_fflags});
+                        end
+                        sh_fflags = retire_fflags;
+                    end else if (retire_fflags !== sh_fflags) begin
+                        bad_flags = bad_flags + 1;
+                        report("fflags changed by an instruction that raises none",
+                               {27'd0, retire_fflags}, {27'd0, sh_fflags});
+                    end
                 end
 
                 if (retire_dmem_ren === 1'b1 && retire_dmem_wen === 1'b1) begin
@@ -350,7 +579,7 @@ module hart_harness #(
                 end else if (retire_dmem_ren === 1'b1 || retire_dmem_wen === 1'b1) begin
                     widx = (retire_dmem_addr - DMEM_BASE) >> 2;
                     if (retire_dmem_addr < DMEM_BASE ||
-                        retire_dmem_addr >= DMEM_BASE + 4 * MEM_WORDS ||
+                        retire_dmem_addr >= DMEM_BASE + 4 * DMEM_WORDS ||
                         retire_dmem_addr[1:0] != 2'b00) begin
                         bad_lane = bad_lane + 1;
                         report("dmem address outside data memory", retire_dmem_addr, DMEM_BASE);
@@ -364,31 +593,50 @@ module hart_harness #(
                             bad_load = bad_load + 1;
                             report("load data from the dcache", retire_dmem_rdata, shadow[widx]);
                         end
-                        lanes = retire_dmem_rdata >> (8 * mask_offset(retire_dmem_mask));
-                        case (funct3)
-                            3'b000:  want = {{24{lanes[7]}}, lanes[7:0]};
-                            3'b001:  want = {{16{lanes[15]}}, lanes[15:0]};
-                            3'b100:  want = {24'd0, lanes[7:0]};
-                            3'b101:  want = {16'd0, lanes[15:0]};
-                            default: want = lanes;
-                        endcase
-                        if (retire_rd_waddr != 5'd0 && retire_rd_wdata !== want) begin
-                            bad_lane = bad_lane + 1;
-                            report("load rd value from rdata", retire_rd_wdata, want);
+                        if (is_flw) begin
+                            if (retire_frd_wdata !== retire_dmem_rdata) begin
+                                bad_lane = bad_lane + 1;
+                                report("flw frd value from rdata", retire_frd_wdata, retire_dmem_rdata);
+                            end
+                        end else begin
+                            lanes = retire_dmem_rdata >> (8 * mask_offset(retire_dmem_mask));
+                            case (funct3)
+                                3'b000:  want = {{24{lanes[7]}}, lanes[7:0]};
+                                3'b001:  want = {{16{lanes[15]}}, lanes[15:0]};
+                                3'b100:  want = {24'd0, lanes[7:0]};
+                                3'b101:  want = {16'd0, lanes[15:0]};
+                                default: want = lanes;
+                            endcase
+                            if (retire_rd_waddr != 5'd0 && retire_rd_wdata !== want) begin
+                                bad_lane = bad_lane + 1;
+                                report("load rd value from rdata", retire_rd_wdata, want);
+                            end
                         end
                     end else begin
                         n_stores = n_stores + 1;
-                        want = retire_rs2_rdata << (8 * mask_offset(retire_dmem_mask));
+                        // fsw stores FP rs2; its integer rs2 is not read.
+                        st_src = is_fsw ? retire_frs2_rdata : retire_rs2_rdata;
+                        want   = st_src << (8 * mask_offset(retire_dmem_mask));
                         for (b = 0; b < 4; b = b + 1) begin
                             if (retire_dmem_mask[b] &&
                                 retire_dmem_wdata[8*b +: 8] !== want[8*b +: 8]) begin
                                 bad_lane = bad_lane + 1;
-                                report("store wdata lane vs rs2", retire_dmem_wdata, want);
+                                report(is_fsw ? "store wdata lane vs frs2" : "store wdata lane vs rs2",
+                                       retire_dmem_wdata, want);
                             end
                             if (retire_dmem_mask[b])
                                 shadow[widx][8*b +: 8] = retire_dmem_wdata[8*b +: 8];
                         end
                     end
+                end
+
+                // Register writes, after every check of this instruction's
+                // sources (an instruction may read the register it writes).
+                if (retire_trap !== 1'b1) begin
+                    if (retire_rd_waddr !== 5'd0)
+                        xs[retire_rd_waddr] = retire_rd_wdata;
+                    if (retire_frd_wen === 1'b1)
+                        fs[retire_frd_waddr] = retire_frd_wdata;
                 end
 
                 if (retire_halt === 1'b1) begin
@@ -404,59 +652,45 @@ module hart_harness #(
     end
 
     // ------------------------------------------------------------------
-    // Optional: overlay the dcache's dirty lines onto main memory
+    // Memory regions (phase_6.pdf 6.1)
     // ------------------------------------------------------------------
-`ifdef HART_TB_PEEK_DCACHE
-    // Off by default because it reads cache.v's storage directly. Once the
-    // names there are final, point these four macros at them and define
-    // HART_TB_PEEK_DCACHE (a `define at the top of each hart_*_tb.v, or
-    // iverilog -DHART_TB_PEEK_DCACHE). s is a runtime set index and w a
-    // constant way index (a genvar), so they work for flat arrays and for
-    // per-way generate blocks alike. DC_TAG is the stored tag, i.e. the
-    // address bits above the set index.
-    `ifndef DC_VALID
-    `define DC_VALID(s, w) dut.dcache.valid_q[(s) * NUM_WAYS + (w)]
-    `define DC_DIRTY(s, w) dut.dcache.dirty_q[(s) * NUM_WAYS + (w)]
-    `define DC_TAG(s, w)   dut.dcache.tag_q[(s) * NUM_WAYS + (w)]
-    `define DC_DATA(s, w)  dut.dcache.data_q[(s) * NUM_WAYS + (w)]
-    `endif
+    reg [8*16-1:0] rg_name [0:N_REGIONS-1];
+    reg [31:0]     rg_lo   [0:N_REGIONS-1];
+    reg [31:0]     rg_hi   [0:N_REGIONS-1];
 
-    localparam NUM_SETS    = NUM_LINES / NUM_WAYS;
-    localparam OFFSET_BITS = $clog2(BLOCK_SIZE);
-    localparam INDEX_BITS  = $clog2(NUM_SETS);
+    initial begin
+        rg_name[0]  = "program data"; rg_lo[0]  = 32'h10010000; rg_hi[0]  = 32'h10017FFF;
+        rg_name[1]  = "muldiv";       rg_lo[1]  = 32'h10020000; rg_hi[1]  = 32'h100217FF;
+        rg_name[2]  = "fp move cmp";  rg_lo[2]  = 32'h10021800; rg_hi[2]  = 32'h10022FFF;
+        rg_name[3]  = "fp convert";   rg_lo[3]  = 32'h10023000; rg_hi[3]  = 32'h100247FF;
+        rg_name[4]  = "fp add mul";   rg_lo[4]  = 32'h10024800; rg_hi[4]  = 32'h10025FFF;
+        rg_name[5]  = "fp fused";     rg_lo[5]  = 32'h10026000; rg_hi[5]  = 32'h100277FF;
+        rg_name[6]  = "fp div sqrt";  rg_lo[6]  = 32'h10027800; rg_hi[6]  = 32'h10028FFF;
+        rg_name[7]  = "fp csr";       rg_lo[7]  = 32'h10029000; rg_hi[7]  = 32'h1002A7FF;
+        rg_name[8]  = "mixed";        rg_lo[8]  = 32'h1002A800; rg_hi[8]  = 32'h1002BFFF;
+        rg_name[9]  = "cache stall";  rg_lo[9]  = 32'h1002C000; rg_hi[9]  = 32'h1002D7FF;
+        // The range the final loads flush through, and the unused tail.
+        rg_name[10] = "flush range";  rg_lo[10] = 32'h10018000; rg_hi[10] = 32'h1001FFFF;
+        rg_name[11] = "tail";         rg_lo[11] = 32'h1002D800; rg_hi[11] = 32'h1002FFFF;
+    end
 
-    reg [31:0] merged [0:MEM_WORDS-1];
-    integer    n_dirty;      // dirty lines overlaid
-    integer    n_dirty_bad;  // dirty lines outside data memory
-    event      do_overlay;
-
-    genvar gw;
-    generate
-        for (gw = 0; gw < NUM_WAYS; gw = gw + 1) begin : g_overlay
-            integer    s;
-            integer    j;
-            reg [31:0] line;
-            always @(do_overlay) begin
-                for (s = 0; s < NUM_SETS; s = s + 1) begin
-                    if (`DC_VALID(s, gw) === 1'b1 && `DC_DIRTY(s, gw) === 1'b1) begin
-                        line = (`DC_TAG(s, gw) << (OFFSET_BITS + INDEX_BITS)) |
-                               (s << OFFSET_BITS);
-                        if (line < DMEM_BASE || line >= DMEM_BASE + 4 * MEM_WORDS) begin
-                            n_dirty_bad = n_dirty_bad + 1;
-                            $display("[FAIL] %0s: dcache set %0d way %0d holds dirty line %h, outside data memory",
-                                     LABEL, s, gw, line);
-                        end else begin
-                            n_dirty = n_dirty + 1;
-                            for (j = 0; j < LINE_WORDS; j = j + 1)
-                                merged[((line - DMEM_BASE) >> 2) + j] =
-                                    `DC_DATA(s, gw) >> (32 * j);
-                        end
-                    end
-                end
+    // Words in [lo, hi] where a memory differs from random_dmem.hex.
+    // which = 0: main memory, 1: the retire-stream shadow.
+    function integer count_diff;
+        input        which;
+        input [31:0] lo;
+        input [31:0] hi;
+        integer a;
+        reg [31:0] v;
+        begin
+            count_diff = 0;
+            for (a = (lo - DMEM_BASE) >> 2; a <= (hi - DMEM_BASE) >> 2; a = a + 1) begin
+                v = which ? shadow[a] : u_dmem.mem[a];
+                if (v !== golden[a])
+                    count_diff = count_diff + 1;
             end
         end
-    endgenerate
-`endif
+    endfunction
 
     // ------------------------------------------------------------------
     // Run
@@ -465,11 +699,12 @@ module hart_harness #(
     reg [8*256-1:0] prog_path;
     reg [8*256-1:0] dmem_path;
     integer i;
+    integer r;
     integer fd;
     integer n_words;
-    integer stale_words;
-    integer stale_lines;
-    integer line_bad;
+    integer sec_main;
+    integer sec_shadow;
+    integer main_vs_shadow;
     integer guard_bad;
     integer cpi_x100;
 
@@ -484,19 +719,32 @@ module hart_harness #(
         bad_inst    = 0;
         bad_pc      = 0;
         bad_lane    = 0;
+        bad_xsrc    = 0;
+        bad_fsrc    = 0;
+        bad_dst     = 0;
+        bad_flags   = 0;
+        bad_csr     = 0;
+        bad_rmtrap  = 0;
         n_traps     = 0;
+        dstall_errs = 0;
         msgs        = 0;
         cycles      = 0;
         idle        = 0;
         retired     = 0;
         n_loads     = 0;
         n_stores    = 0;
+        n_fp        = 0;
+        n_csr       = 0;
         halted      = 1'b0;
         have_prev   = 1'b0;
-        stale_words = 0;
-        stale_lines = 0;
-        for (i = 0; i < MEM_WORDS; i = i + 1)
+        sh_fflags   = 5'd0;
+        sh_frm      = 3'd0;
+        for (i = 0; i < DMEM_WORDS; i = i + 1)
             shadow[i] = 32'd0;
+        for (i = 0; i < 32; i = i + 1) begin
+            xs[i] = 32'd0;
+            fs[i] = 32'd0;   // +0.0
+        end
 
         wait (i_start === 1'b1);
 
@@ -514,8 +762,9 @@ module hart_harness #(
         u_imem.load_hex(prog_path, prog_words);
         $readmemh(dmem_path, golden);
 
-        $display("--- %0s: EVICT_POLICY=%0d NUM_WAYS=%0d CACHE_SIZE=%0d BLOCK_SIZE=%0d PREFETCH_EN=%0d, memory latency %0d ---",
-                 LABEL, EVICT_POLICY, NUM_WAYS, CACHE_SIZE, BLOCK_SIZE, PREFETCH_EN, LATENCY);
+        $display("--- %0s: EVICT_POLICY=%0d NUM_WAYS=%0d CACHE_SIZE=%0d BLOCK_SIZE=%0d PREFETCH_EN=%0d, memory latency %0d, section %h-%h ---",
+                 LABEL, EVICT_POLICY, NUM_WAYS, CACHE_SIZE, BLOCK_SIZE, PREFETCH_EN, LATENCY,
+                 SEC_LO, SEC_HI);
 
         running = 1'b1;
         repeat (5) @(posedge clk);
@@ -541,6 +790,7 @@ module hart_harness #(
         repeat (4 * LATENCY + 20) @(posedge clk);
         running = 1'b0;
 
+        check("program fits in instruction memory", prog_words > 0 && prog_words < IMEM_WORDS);
         check("program ran to its final ebreak", halted);
         // With nothing retired these would pass without checking anything.
         if (retired > 0) begin
@@ -548,88 +798,72 @@ module hart_harness #(
             check("retire PC sequence", bad_pc == 0);
             check("no traps", n_traps == 0);
             check("load data returned by the dcache", bad_load == 0);
-            check("dmem address/mask/lane formatting", bad_lane == 0);
+            check("dmem address/mask/lane formatting (incl. flw/fsw)", bad_lane == 0);
+            check("integer sources match the shadow register file", bad_xsrc == 0);
+            check("FP sources match the shadow FP register file", bad_fsrc == 0);
+            check("rd/frd reporting of F instructions", bad_dst == 0);
+            check("fflags accrue and match the shadow fcsr", bad_flags == 0);
+            check("CSR instructions read the shadow fcsr", bad_csr == 0);
+            check("dynamic-rm trap matches the shadow frm", bad_rmtrap == 0);
         end
-        if (msgs > 0)
-            $display("       %0d retire mismatches: dcache load data %0d, icache word %0d, pc %0d, lanes %0d, traps %0d",
-                     msgs, bad_load, bad_inst, bad_pc, bad_lane, n_traps);
+        check("no dcache request while ex_stall is high", dstall_errs == 0);
+        $display("  %0s: retire-stream invariant errors: xsrc %0d, fsrc %0d, dst %0d, fflags %0d, csr %0d, rm-trap %0d, dcache-in-stall %0d | lanes %0d, load %0d, inst %0d, pc %0d, traps %0d",
+                 LABEL, bad_xsrc, bad_fsrc, bad_dst, bad_flags, bad_csr, bad_rmtrap, dstall_errs,
+                 bad_lane, bad_load, bad_inst, bad_pc, n_traps);
 
         if (halted) begin
-            // Architectural result, from the retire stream.
+            // Every dirty line was evicted before the ebreak, so main memory
+            // is the architectural memory.
+            main_vs_shadow = 0;
+            for (i = 0; i < DMEM_WORDS; i = i + 1) begin
+                if (u_dmem.mem[i] !== shadow[i]) begin
+                    if (main_vs_shadow < 10)
+                        $display("[FAIL] %0s: main memory at %h: %h, but the retire stream stored %h",
+                                 LABEL, DMEM_BASE + 4 * i, u_dmem.mem[i], shadow[i]);
+                    main_vs_shadow = main_vs_shadow + 1;
+                end
+            end
+            check("main memory after halt equals the retire-stream stores", main_vs_shadow == 0);
+
+            // INFO: every region, main memory and retire stream vs golden.
+            for (r = 0; r < N_REGIONS; r = r + 1)
+                $display("  INFO %0s: golden %-12s %h-%h: main memory %0d words differ, retire stream %0d",
+                         LABEL, rg_name[r], rg_lo[r], rg_hi[r],
+                         count_diff(1'b0, rg_lo[r], rg_hi[r]),
+                         count_diff(1'b1, rg_lo[r], rg_hi[r]));
+
+            // The section verdict.
+            sec_main   = count_diff(1'b0, SEC_LO, SEC_HI);
+            sec_shadow = count_diff(1'b1, SEC_LO, SEC_HI);
             n_words = 0;
-            for (i = 0; i < MEM_WORDS; i = i + 1) begin
-                if (shadow[i] !== golden[i]) begin
+            for (i = (SEC_LO - DMEM_BASE) >> 2; i <= (SEC_HI - DMEM_BASE) >> 2; i = i + 1) begin
+                if (u_dmem.mem[i] !== golden[i]) begin
                     if (n_words < 10)
-                        $display("[FAIL] %0s: final memory (retire stream) at %h: got %h, expected %h",
-                                 LABEL, DMEM_BASE + 4 * i, shadow[i], golden[i]);
+                        $display("[FAIL] %0s: section word at %h: got %h, expected %h",
+                                 LABEL, DMEM_BASE + 4 * i, u_dmem.mem[i], golden[i]);
                     n_words = n_words + 1;
                 end
             end
-            check("final data memory from the retire stream matches random_dmem.hex",
-                  n_words == 0);
+            $display("  %0s: section %h-%h: main memory %0d words differ, retire stream %0d",
+                     LABEL, SEC_LO, SEC_HI, sec_main, sec_shadow);
+            check("section: retire-stream stores match random_dmem.hex", sec_shadow == 0);
+            check("section: main memory after halt matches random_dmem.hex", sec_main == 0);
 
-            // Main memory: stale words are fine only inside dirty dcache lines.
-            stale_words = 0;
-            stale_lines = 0;
-            for (i = 0; i < MEM_WORDS; i = i + 1) begin
-                if (i % LINE_WORDS == 0)
-                    line_bad = 0;
-                if (u_dmem.mem[i] !== golden[i]) begin
-                    stale_words = stale_words + 1;
-                    if (!line_bad)
-                        stale_lines = stale_lines + 1;
-                    line_bad = 1;
-                end
-            end
-            if (stale_lines > NUM_LINES)
-                $display("[FAIL] %0s: %0d lines of main memory differ from random_dmem.hex, but the dcache only holds %0d",
-                         LABEL, stale_lines, NUM_LINES);
-            check("main memory: no more stale lines than the dcache can hold dirty",
-                  stale_lines <= NUM_LINES);
             guard_bad = 0;
-            for (i = MEM_WORDS; i < MEM_WORDS + GUARD_WORDS; i = i + 1)
+            for (i = DMEM_WORDS; i < DMEM_WORDS + GUARD_WORDS; i = i + 1)
                 if (u_dmem.mem[i] !== 32'd0)
                     guard_bad = guard_bad + 1;
             check("nothing written past the end of data memory", guard_bad == 0);
-
-`ifdef HART_TB_PEEK_DCACHE
-            for (i = 0; i < MEM_WORDS; i = i + 1)
-                merged[i] = u_dmem.mem[i];
-            n_dirty     = 0;
-            n_dirty_bad = 0;
-            -> do_overlay;
-            #1;
-            n_words = 0;
-            for (i = 0; i < MEM_WORDS; i = i + 1) begin
-                if (merged[i] !== golden[i]) begin
-                    if (n_words < 10)
-                        $display("[FAIL] %0s: main memory + dirty dcache lines at %h: got %h (memory %h), expected %h",
-                                 LABEL, DMEM_BASE + 4 * i, merged[i], u_dmem.mem[i], golden[i]);
-                    n_words = n_words + 1;
-                end
-            end
-            check("main memory with dirty dcache lines overlaid matches random_dmem.hex",
-                  n_words == 0 && n_dirty_bad == 0);
-`endif
         end
 
         check("memory protocol (see mem_model.vh)",
               u_imem.errors == 0 && u_dmem.errors == 0);
 
         cpi_x100 = retired > 0 ? (cycles * 100) / retired : 0;
-        $display("  %0s: %0d cycles, %0d retired, CPI %0d.%02d | imem reads %0d | dmem reads %0d, write-backs %0d, write-throughs %0d | %0d loads, %0d stores",
-                 LABEL, cycles, retired, cpi_x100 / 100, cpi_x100 % 100,
+        $display("  %0s: %0d cycles, %0d retired (%0d F/CSR, %0d CSR), CPI %0d.%02d | imem reads %0d | dmem reads %0d, write-backs %0d, write-throughs %0d | %0d loads, %0d stores",
+                 LABEL, cycles, retired, n_fp, n_csr, cpi_x100 / 100, cpi_x100 % 100,
                  u_imem.n_rd, u_dmem.n_rd, u_dmem.n_wb, u_dmem.n_wt,
                  n_loads, n_stores);
-`ifdef HART_TB_PEEK_DCACHE
-        if (halted)
-            $display("  %0s: main memory at halt: %0d stale words in %0d lines; %0d dirty lines overlaid",
-                     LABEL, stale_words, stale_lines, n_dirty);
-`else
-        if (halted)
-            $display("  %0s: main memory at halt: %0d stale words in %0d lines (dirty in the dcache; not checked word by word without HART_TB_PEEK_DCACHE)",
-                     LABEL, stale_words, stale_lines);
-`endif
         if (u_dmem.n_wr_empty + u_dmem.n_rd_wr_same + u_dmem.n_wr_inflight > 0)
             $display("  %0s: note: dmem writes with no byte enabled %0d, read+write of one line in a cycle %0d, writes to a line with a read in flight %0d",
                      LABEL, u_dmem.n_wr_empty, u_dmem.n_rd_wr_same, u_dmem.n_wr_inflight);
