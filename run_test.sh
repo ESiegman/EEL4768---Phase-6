@@ -45,7 +45,7 @@ fi
 #   hart_fp_csr           fp csr           0x10029000-0x1002A7FF
 #   hart_mixed            mixed            0x1002A800-0x1002BFFF
 #   hart_cache_stall      cache stall      0x1002C000-0x1002D7FF
-MODULES=(alu imm rf_bypass rf_no_bypass decoder cache plru fpu hart_muldiv hart_fp_move_compare hart_fp_convert hart_fp_arith hart_fp_div_sqrt hart_fp_csr hart_mixed hart_cache_stall)
+MODULES=(alu imm rf_bypass rf_no_bypass decoder cache plru fpu fpu_round hart_muldiv hart_fp_move_compare hart_fp_convert hart_fp_arith hart_fp_div_sqrt hart_fp_csr hart_mixed hart_cache_stall)
 
 # Most checks share a name with the .v file they test; rf's two checks both
 # target rf.v and hart's eight target hart.v. No associative arrays on

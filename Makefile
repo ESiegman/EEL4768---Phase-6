@@ -9,7 +9,7 @@ help:
 	@echo
 	@echo "Details:      ./run_test.sh <name> [submission_dir]"
 	@echo "Write your own <check>_tb.v for alu, imm, rf_bypass, rf_no_bypass,"
-	@echo "decoder, cache, plru, fpu, hart_muldiv, hart_fp_move_compare,"
+	@echo "decoder, cache, plru, fpu, fpu_round, hart_muldiv, hart_fp_move_compare,"
 	@echo "hart_fp_convert, hart_fp_arith, hart_fp_div_sqrt, hart_fp_csr, hart_mixed"
 	@echo "and hart_cache_stall -- see README.md and example/opmux_tb.v."
 	@echo "Run pip install ./lint once so make test also runs the ece552 rule"

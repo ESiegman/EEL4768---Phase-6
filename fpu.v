@@ -269,7 +269,9 @@ module fpu (
     wire fma_inv_mul = (a_inf & fb_zero) | (a_zero & fb_inf);
     wire fma_nan_in  = a_nan | fb_nan | fc_nan;
     wire fma_snan_in = a_snan | fb_snan | fc_snan;
-    wire fma_p_inf   = a_inf | fb_inf;
+    // A NaN multiplicand does not produce an infinite product; otherwise
+    // qNaN * infinity plus opposite infinity would spuriously raise NV.
+    wire fma_p_inf   = (a_inf | fb_inf) & ~(a_nan | fb_nan);
     wire fma_p_sign  = fa_sign ^ fb_sign;
     wire fma_inv_add = fma_p_inf & fc_inf & (fma_p_sign != fc_sign);
     wire fma_nan_out = fma_inv_mul | fma_nan_in | fma_inv_add;
@@ -333,36 +335,27 @@ module fpu (
     wire [ 9:0] fma_o_exp;
     wire [25:0] fma_o_sig;
 
-    // MISSING UNIT: fpu_fma (Bowen) is not on main yet, so fadd, fsub,
-    // fmul and the fused instructions return 0 with no flags (special
-    // operands still work, above). When fpu_fma.v lands, delete the four
-    // tie-off assigns below and uncomment this instance:
-    //
-    // fpu_fma u_fma (
-    //     .i_clk     (i_clk),
-    //     .i_rst     (i_rst),
-    //     .i_valid   (fma_valid),
-    //     .i_advance (i_advance),
-    //     .i_mul_only(mul_only),
-    //     .i_rm      (rm),
-    //     .i_a_sign  (fma_a_sign),
-    //     .i_a_exp   (fma_a_exp),
-    //     .i_a_sig   (fma_a_sig),
-    //     .i_b_sign  (fma_b_sign),
-    //     .i_b_exp   (fma_b_exp),
-    //     .i_b_sig   (fma_b_sig),
-    //     .i_c_sign  (fma_c_sign),
-    //     .i_c_exp   (fma_c_exp),
-    //     .i_c_sig   (fma_c_sig),
-    //     .o_busy    (fma_busy),
-    //     .o_sign    (fma_o_sign),
-    //     .o_exp     (fma_o_exp),
-    //     .o_sig     (fma_o_sig)
-    // );
-    assign fma_busy   = 1'b0;
-    assign fma_o_sign = 1'b0;
-    assign fma_o_exp  = 10'd0;
-    assign fma_o_sig  = 26'd0;
+    fpu_fma u_fma (
+        .i_clk     (i_clk),
+        .i_rst     (i_rst),
+        .i_valid   (fma_valid),
+        .i_advance (i_advance),
+        .i_mul_only(mul_only),
+        .i_rm      (rm),
+        .i_a_sign  (fma_a_sign),
+        .i_a_exp   (fma_a_exp),
+        .i_a_sig   (fma_a_sig),
+        .i_b_sign  (fma_b_sign),
+        .i_b_exp   (fma_b_exp),
+        .i_b_sig   (fma_b_sig),
+        .i_c_sign  (fma_c_sign),
+        .i_c_exp   (fma_c_exp),
+        .i_c_sig   (fma_c_sig),
+        .o_busy    (fma_busy),
+        .o_sign    (fma_o_sign),
+        .o_exp     (fma_o_exp),
+        .o_sig     (fma_o_sig)
+    );
 
     wire        ds_busy;
     wire        ds_o_sign;
@@ -402,29 +395,19 @@ module fpu (
     wire [ 9:0] cvt_i2f_exp;
     wire [25:0] cvt_i2f_sig;
 
-    // MISSING UNIT: fpu_cvt (Bowen) is not on main yet, so fcvt.w[u].s
-    // and fcvt.s.w[u] return 0 with no flags (fcvt.w[u].s of NaN and
-    // infinity still works, above). When fpu_cvt.v lands, delete the five
-    // tie-off assigns below and uncomment this instance:
-    //
-    // fpu_cvt u_cvt (
-    //     .i_unsigned  (cvt_unsigned),
-    //     .i_rm        (rm),
-    //     .i_a_sign    (a_sign),
-    //     .i_a_exp     (a_nexp),
-    //     .i_a_sig     (a_nsig),
-    //     .o_f2i_result(cvt_f2i_result),
-    //     .o_f2i_flags (cvt_f2i_flags),
-    //     .i_int       (i_xrs1),
-    //     .o_i2f_sign  (cvt_i2f_sign),
-    //     .o_i2f_exp   (cvt_i2f_exp),
-    //     .o_i2f_sig   (cvt_i2f_sig)
-    // );
-    assign cvt_f2i_result = 32'd0;
-    assign cvt_f2i_flags  = 5'd0;
-    assign cvt_i2f_sign   = 1'b0;
-    assign cvt_i2f_exp    = 10'd0;
-    assign cvt_i2f_sig    = 26'd0;
+    fpu_cvt u_cvt (
+        .i_unsigned  (cvt_unsigned),
+        .i_rm        (rm),
+        .i_a_sign    (a_sign),
+        .i_a_exp     (a_nexp),
+        .i_a_sig     (a_nsig),
+        .o_f2i_result(cvt_f2i_result),
+        .o_f2i_flags (cvt_f2i_flags),
+        .i_int       (i_xrs1),
+        .o_i2f_sign  (cvt_i2f_sign),
+        .o_i2f_exp   (cvt_i2f_exp),
+        .o_i2f_sig   (cvt_i2f_sig)
+    );
 
     // The one rounder, shared by every rounding instruction. Only one is in
     // EX at a time, and each datapath holds its output until i_advance.
@@ -434,21 +417,14 @@ module fpu (
     wire [31:0] rnd_result;
     wire [ 4:0] rnd_flags;
 
-    // MISSING UNIT: fpu_round (Bowen) is not on main yet, so every
-    // rounding instruction without a special operand returns 0 with no
-    // flags. When fpu_round.v lands, delete the two tie-off assigns below
-    // and uncomment this instance:
-    //
-    // fpu_round u_round (
-    //     .i_sign  (rnd_sign),
-    //     .i_exp   (rnd_exp),
-    //     .i_sig   (rnd_sig),
-    //     .i_rm    (rm),
-    //     .o_result(rnd_result),
-    //     .o_flags (rnd_flags)
-    // );
-    assign rnd_result = 32'd0;
-    assign rnd_flags  = 5'd0;
+    fpu_round u_round (
+        .i_sign  (rnd_sign),
+        .i_exp   (rnd_exp),
+        .i_sig   (rnd_sig),
+        .i_rm    (rm),
+        .o_result(rnd_result),
+        .o_flags (rnd_flags)
+    );
 
     // A datapath's busy only counts for the instruction that started it.
     // Nothing here depends on i_advance: the hart's i_advance depends on

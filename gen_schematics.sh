@@ -35,7 +35,8 @@ module_sources() {
     case "$1" in
         decoder) echo "decoder.v imm.v" ;;
         cache)   echo "cache.v plru.v" ;;
-        hart)    echo "hart.v alu.v rf.v decoder.v imm.v cache.v plru.v fpu.v" ;;
+        fpu)     echo "fpu.v fpu_fma.v fpu_cvt.v fpu_round.v" ;;
+        hart)    echo "hart.v alu.v rf.v decoder.v imm.v cache.v plru.v fpu.v fpu_fma.v fpu_cvt.v fpu_round.v" ;;
         *)       echo "$1.v" ;;
     esac
 }
