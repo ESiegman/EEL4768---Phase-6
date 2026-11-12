@@ -53,11 +53,17 @@ module decoder_tb;
   wire        o_dmem_memh;
   wire        o_dmem_memw;
   wire        o_dmem_memu;
-  wire [ 3:0] o_rd_sel;
+  wire [ 4:0] o_rd_sel;
   wire        o_pc_sel;
   wire        o_uses_rs1;
   wire        o_uses_rs2;
-  wire        o_is_load;
+  wire        o_mext;
+  wire        o_fpu;
+  wire        o_frs1_en;
+  wire        o_frs2_en;
+  wire        o_frs3_en;
+  wire [ 4:0] o_rs3;
+  wire        o_frd_en;
 
   decoder dut (
       .i_inst           (inst),
@@ -89,7 +95,13 @@ module decoder_tb;
       .o_pc_sel         (o_pc_sel),
       .o_uses_rs1       (o_uses_rs1),
       .o_uses_rs2       (o_uses_rs2),
-      .o_is_load        (o_is_load)
+      .o_mext           (o_mext),
+      .o_fpu            (o_fpu),
+      .o_frs1_en        (o_frs1_en),
+      .o_frs2_en        (o_frs2_en),
+      .o_frs3_en        (o_frs3_en),
+      .o_rs3            (o_rs3),
+      .o_frd_en         (o_frd_en)
   );
 
   // --------------------------------------------------------------------
@@ -120,11 +132,17 @@ module decoder_tb;
   reg        e_dmem_memh;
   reg        e_dmem_memw;
   reg        e_dmem_memu;
-  reg [ 3:0] e_rd_sel;
+  reg [ 4:0] e_rd_sel;
   reg        e_pc_sel;
   reg        e_uses_rs1;
   reg        e_uses_rs2;
-  reg        e_is_load;
+  reg        e_mext;
+  reg        e_fpu;
+  reg        e_frs1_en;
+  reg        e_frs2_en;
+  reg        e_frs3_en;
+  reg [ 4:0] e_rs3;
+  reg        e_frd_en;
 
   integer pass_count;
   integer fail_count;
@@ -249,11 +267,17 @@ module decoder_tb;
       e_dmem_memh       = 1'b0;
       e_dmem_memw       = 1'b0;
       e_dmem_memu       = 1'b0;
-      e_rd_sel          = 4'b0000;
+      e_rd_sel          = 5'b00000;
       e_pc_sel          = 1'b0;
       e_uses_rs1        = 1'b0;
       e_uses_rs2        = 1'b0;
-      e_is_load         = 1'b0;
+      e_mext            = 1'b0;
+      e_fpu             = 1'b0;
+      e_frs1_en         = 1'b0;
+      e_frs2_en         = 1'b0;
+      e_frs3_en         = 1'b0;
+      e_rs3             = inst[31:27];
+      e_frd_en          = 1'b0;
 
       if (BRANCH_FLAGS_GATED) begin
         e_branch_equal    = 1'b0;
@@ -303,7 +327,13 @@ module decoder_tb;
       if (o_pc_sel          !== e_pc_sel)          bad = 1'b1;
       if (o_uses_rs1        !== e_uses_rs1)        bad = 1'b1;
       if (o_uses_rs2        !== e_uses_rs2)        bad = 1'b1;
-      if (o_is_load         !== e_is_load)         bad = 1'b1;
+      if (o_mext            !== e_mext)            bad = 1'b1;
+      if (o_fpu             !== e_fpu)             bad = 1'b1;
+      if (o_frs1_en         !== e_frs1_en)         bad = 1'b1;
+      if (o_frs2_en         !== e_frs2_en)         bad = 1'b1;
+      if (o_frs3_en         !== e_frs3_en)         bad = 1'b1;
+      if (o_rs3             !== e_rs3)             bad = 1'b1;
+      if (o_frd_en          !== e_frd_en)          bad = 1'b1;
 
       if (!bad) begin
         pass_count = pass_count + 1;
@@ -340,7 +370,13 @@ module decoder_tb;
         if (o_pc_sel       !== e_pc_sel)       $display("         pc_sel:         exp=%b got=%b", e_pc_sel, o_pc_sel);
         if (o_uses_rs1     !== e_uses_rs1)     $display("         uses_rs1:       exp=%b got=%b", e_uses_rs1, o_uses_rs1);
         if (o_uses_rs2     !== e_uses_rs2)     $display("         uses_rs2:       exp=%b got=%b", e_uses_rs2, o_uses_rs2);
-        if (o_is_load      !== e_is_load)      $display("         is_load:        exp=%b got=%b", e_is_load, o_is_load);
+        if (o_mext         !== e_mext)         $display("         mext:           exp=%b got=%b", e_mext, o_mext);
+        if (o_fpu          !== e_fpu)          $display("         fpu:            exp=%b got=%b", e_fpu, o_fpu);
+        if (o_frs1_en      !== e_frs1_en)      $display("         frs1_en:        exp=%b got=%b", e_frs1_en, o_frs1_en);
+        if (o_frs2_en      !== e_frs2_en)      $display("         frs2_en:        exp=%b got=%b", e_frs2_en, o_frs2_en);
+        if (o_frs3_en      !== e_frs3_en)      $display("         frs3_en:        exp=%b got=%b", e_frs3_en, o_frs3_en);
+        if (o_rs3          !== e_rs3)          $display("         rs3:            exp=%0d got=%0d", e_rs3, o_rs3);
+        if (o_frd_en       !== e_frd_en)       $display("         frd_en:         exp=%b got=%b", e_frd_en, o_frd_en);
       end
     end
   endtask
@@ -360,7 +396,7 @@ module decoder_tb;
   // Shorthand for a legal register-writing instruction
   task expect_writes_rd;
     input [4:0] rd;
-    input [3:0] sel;
+    input [4:0] sel;
     begin
       e_legal  = 1'b1;
       e_rd     = rd;
@@ -368,6 +404,142 @@ module decoder_tb;
     end
   endtask
 
+
+  // --------------------------------------------------------------------
+  // Phase 6 helpers
+  // --------------------------------------------------------------------
+  localparam [6:0] OPC_LOADFP  = 7'b0000111;
+  localparam [6:0] OPC_STOREFP = 7'b0100111;
+  localparam [6:0] OPC_OPFP    = 7'b1010011;
+  localparam [6:0] OPC_MADD    = 7'b1000011;
+  localparam [6:0] OPC_MSUB    = 7'b1000111;
+  localparam [6:0] OPC_NMSUB   = 7'b1001011;
+  localparam [6:0] OPC_NMADD   = 7'b1001111;
+  localparam [6:0] F7_MEXT     = 7'b0000001;
+
+  function [31:0] enc_r4;
+    input [4:0] rs3;
+    input [1:0] fmt;
+    input [4:0] rs2;
+    input [4:0] rs1;
+    input [2:0] rm;
+    input [4:0] rd;
+    input [6:0] op;
+    begin
+      enc_r4 = {rs3, fmt, rs2, rs1, rm, rd, op};
+    end
+  endfunction
+
+  // An RV32M instruction: integer rs1/rs2 -> integer rd, ALU result, opsel
+  // carries funct3.
+  task expect_mext;
+    begin
+      expect_writes_rd(inst[11:7], 5'b00001);
+      expect_reads(1'b1, 1'b1);
+      e_alu_opsel = inst[14:12];
+      e_mext      = 1'b1;
+    end
+  endtask
+
+  // An fpu instruction that writes FP rd. o_rd stays 0.
+  task expect_fpu_frd;
+    input fr1;
+    input fr2;
+    input fr3;
+    input xr1;
+    begin
+      e_legal   = 1'b1;
+      e_fpu     = 1'b1;
+      e_frd_en  = 1'b1;
+      e_frs1_en = fr1;
+      e_frs2_en = fr2;
+      e_frs3_en = fr3;
+      e_uses_rs1 = xr1;
+    end
+  endtask
+
+  // An fpu instruction that writes integer rd from the fpu (rd_sel[4]).
+  task expect_fpu_xrd;
+    input fr1;
+    input fr2;
+    input xr1;
+    begin
+      expect_writes_rd(inst[11:7], 5'b10000);
+      e_fpu      = 1'b1;
+      e_frs1_en  = fr1;
+      e_frs2_en  = fr2;
+      e_uses_rs1 = xr1;
+    end
+  endtask
+
+  // Independent legality model for OP-FP, straight from phase_6.pdf 4.7
+  // and 5.4.1. Returns {legal, writes_frd, reads_frs1, reads_frs2,
+  // reads_xrs1}.
+  function [4:0] ref_opfp;
+    input [6:0] f7;
+    input [2:0] f3;
+    input [4:0] r2;
+    reg rmok;
+    begin
+      rmok = (f3 != 3'b101) && (f3 != 3'b110);
+      case (f7)
+        7'b0000000, 7'b0000100, 7'b0001000, 7'b0001100:            // fadd fsub fmul fdiv
+          ref_opfp = rmok ? 5'b11110 : 5'b00000;
+        7'b0101100:                                                 // fsqrt
+          ref_opfp = (rmok && r2 == 5'd0) ? 5'b11100 : 5'b00000;
+        7'b0010000:                                                 // fsgnj[n|x]
+          ref_opfp = (f3 <= 3'b010) ? 5'b11110 : 5'b00000;
+        7'b0010100:                                                 // fmin fmax
+          ref_opfp = (f3 <= 3'b001) ? 5'b11110 : 5'b00000;
+        7'b1010000:                                                 // fle flt feq
+          ref_opfp = (f3 <= 3'b010) ? 5'b10110 : 5'b00000;
+        7'b1110000:                                                 // fmv.x.w fclass
+          ref_opfp = (r2 == 5'd0 && f3 <= 3'b001) ? 5'b10100 : 5'b00000;
+        7'b1100000:                                                 // fcvt.w[u].s
+          ref_opfp = (rmok && r2 <= 5'd1) ? 5'b10100 : 5'b00000;
+        7'b1101000:                                                 // fcvt.s.w[u]
+          ref_opfp = (rmok && r2 <= 5'd1) ? 5'b11001 : 5'b00000;
+        7'b1111000:                                                 // fmv.w.x
+          ref_opfp = (r2 == 5'd0 && f3 == 3'b000) ? 5'b11001 : 5'b00000;
+        default:
+          ref_opfp = 5'b00000;
+      endcase
+    end
+  endfunction
+
+  integer sw_bad;   // sweep mismatches
+  integer sw_n;     // sweep vectors
+  integer a, b, c;
+  reg [4:0] r;
+
+  // Sweep check: the classifying outputs only, no per-vector PASS line.
+  task sweep_check;
+    input       x_legal;
+    input       x_fpu;
+    input       x_frs1;
+    input       x_frs2;
+    input       x_frs3;
+    input       x_frd;
+    input       x_xrs1;
+    input [4:0] x_rd_sel;
+    input [4:0] x_rd;
+    begin
+      #1;
+      sw_n = sw_n + 1;
+      if (o_legal !== x_legal || o_fpu !== x_fpu || o_frs1_en !== x_frs1 ||
+          o_frs2_en !== x_frs2 || o_frs3_en !== x_frs3 || o_frd_en !== x_frd ||
+          o_uses_rs1 !== x_xrs1 || o_rd_sel !== x_rd_sel || o_rd !== x_rd ||
+          o_mext !== 1'b0 || o_halt !== 1'b0 || o_dmem_ren !== 1'b0 || o_dmem_wen !== 1'b0 ||
+          o_branch !== 1'b0 || o_jump !== 1'b0) begin
+        sw_bad = sw_bad + 1;
+        if (sw_bad <= 10)
+          $display("[FAIL] sweep inst=%08h: legal %b/%b fpu %b/%b frs %b%b%b/%b%b%b frd %b/%b xrs1 %b/%b rd_sel %b/%b rd %0d/%0d",
+                   inst, o_legal, x_legal, o_fpu, x_fpu, o_frs1_en, o_frs2_en, o_frs3_en,
+                   x_frs1, x_frs2, x_frs3, o_frd_en, x_frd, o_uses_rs1, x_xrs1,
+                   o_rd_sel, x_rd_sel, o_rd, x_rd);
+      end
+    end
+  endtask
 
   // Tests
   initial begin
@@ -599,7 +771,6 @@ module decoder_tb;
     e_immediate  = sext12(12'h010);
     e_imm_valid  = 1'b1;
     expect_reads(1'b1, 1'b0);
-    e_is_load = 1'b1;
     check("lb x1, 16(x2)");
 
     inst = enc_i(12'h010, 5'd2, 3'b001, 5'd1, OPC_LOAD);
@@ -612,7 +783,6 @@ module decoder_tb;
     e_immediate  = sext12(12'h010);
     e_imm_valid  = 1'b1;
     expect_reads(1'b1, 1'b0);
-    e_is_load = 1'b1;
     check("lh x1, 16(x2)");
 
     inst = enc_i(12'hFF0, 5'd2, 3'b010, 5'd1, OPC_LOAD);
@@ -625,7 +795,6 @@ module decoder_tb;
     e_immediate  = sext12(12'hFF0);
     e_imm_valid  = 1'b1;
     expect_reads(1'b1, 1'b0);
-    e_is_load = 1'b1;
     check("lw x1, -16(x2)");
 
     inst = enc_i(12'h010, 5'd2, 3'b100, 5'd1, OPC_LOAD);
@@ -639,7 +808,6 @@ module decoder_tb;
     e_immediate  = sext12(12'h010);
     e_imm_valid  = 1'b1;
     expect_reads(1'b1, 1'b0);
-    e_is_load = 1'b1;
     check("lbu x1, 16(x2)");
 
     inst = enc_i(12'h010, 5'd2, 3'b101, 5'd1, OPC_LOAD);
@@ -653,7 +821,6 @@ module decoder_tb;
     e_immediate  = sext12(12'h010);
     e_imm_valid  = 1'b1;
     expect_reads(1'b1, 1'b0);
-    e_is_load = 1'b1;
     check("lhu x1, 16(x2)");
 
     // ================================================================
@@ -877,20 +1044,19 @@ module decoder_tb;
     e_imm_valid = 1'b1;
     check("jal x1, max offset: rs1/rs2 fields set, unused");
 
-    // the load-use producer from phase_4.pdf 4.2.1: is_load high, and the
+    // the load-use producer from phase_4.pdf 4.2.1: a load, and the
     // rs2 field (imm[4:0] = 4 -> x4) is not a read
     inst = enc_i(12'd4, 5'd11, 3'b010, 5'd12, OPC_LOAD);
     expect_defaults;
     expect_writes_rd(5'd12, 4'b1000);
     expect_reads(1'b1, 1'b0);
-    e_is_load    = 1'b1;
     e_op2_sel    = 1'b1;
     e_dmem_ren   = 1'b1;
     e_dmem_memw  = 1'b1;
     e_dmem_align = 2'b11;
     e_immediate  = 32'd4;
     e_imm_valid  = 1'b1;
-    check("lw x12, 4(x11): is_load, rs2 field unused");
+    check("lw x12, 4(x11): load, rs2 field unused");
 
     // the load-store consumer: a store reads rs2 (the data) and is not a load
     inst = enc_s(12'd8, 5'd12, 5'd10, 3'b010, OPC_STORE);
@@ -908,7 +1074,7 @@ module decoder_tb;
     // an illegal load funct3 must not look like a load to the hazard unit
     inst = enc_i(12'd4, 5'd11, 3'b011, 5'd12, OPC_LOAD);
     expect_defaults;
-    check("load funct3=011: not is_load, reads nothing");
+    check("load funct3=011: not a load, reads nothing");
 
     // ================================================================
     $display("--- illegal encodings ---");
@@ -1001,11 +1167,201 @@ module decoder_tb;
     expect_defaults;
     check("jalr funct3=111 (illegal)");
 
+
+    // ================================================================
+    $display("--- RV32M (phase_6.pdf 4.3) ---");
+    // ================================================================
+    inst = enc_r(F7_MEXT, 5'd3, 5'd2, 3'b000, 5'd1, OPC_OP);  expect_defaults; expect_mext; check("mul x1, x2, x3");
+    inst = enc_r(F7_MEXT, 5'd6, 5'd5, 3'b001, 5'd4, OPC_OP);  expect_defaults; expect_mext; check("mulh x4, x5, x6");
+    inst = enc_r(F7_MEXT, 5'd9, 5'd8, 3'b010, 5'd7, OPC_OP);  expect_defaults; expect_mext; check("mulhsu x7, x8, x9");
+    inst = enc_r(F7_MEXT, 5'd12,5'd11,3'b011, 5'd10, OPC_OP); expect_defaults; expect_mext; check("mulhu x10, x11, x12 (alu_unsigned stays 0)");
+    inst = enc_r(F7_MEXT, 5'd15,5'd14,3'b100, 5'd13, OPC_OP); expect_defaults; expect_mext; check("div x13, x14, x15");
+    inst = enc_r(F7_MEXT, 5'd18,5'd17,3'b101, 5'd16, OPC_OP); expect_defaults; expect_mext; check("divu x16, x17, x18 (alu_arith stays 0)");
+    inst = enc_r(F7_MEXT, 5'd21,5'd20,3'b110, 5'd19, OPC_OP); expect_defaults; expect_mext; check("rem x19, x20, x21");
+    inst = enc_r(F7_MEXT, 5'd31,5'd30,3'b111, 5'd29, OPC_OP); expect_defaults; expect_mext; check("remu x29, x30, x31");
+    inst = enc_r(F7_MEXT, 5'd3, 5'd2, 3'b100, 5'd0, OPC_OP);  expect_defaults; expect_mext; check("div x0, x2, x3 (rd = x0 still legal)");
+    // funct7 = 0000001 on OP-IMM is not RV32M
+    inst = enc_i({F7_MEXT, 5'd4}, 5'd2, 3'b001, 5'd1, OPC_OPIMM); expect_defaults; check("slli with funct7=0000001 (illegal)");
+    inst = enc_r(7'b0000011, 5'd3, 5'd2, 3'b000, 5'd1, OPC_OP); expect_defaults; check("OP funct7=0000011 (illegal)");
+    inst = enc_r(7'b0100001, 5'd3, 5'd2, 3'b100, 5'd1, OPC_OP); expect_defaults; check("OP funct7=0100001 funct3=100 (illegal)");
+
+    // ================================================================
+    $display("--- flw / fsw (phase_6.pdf 4.7.1) ---");
+    // ================================================================
+    inst = enc_i(12'hFFC, 5'd10, 3'b010, 5'd7, OPC_LOADFP);
+    expect_defaults;
+    e_legal = 1'b1; e_rd = 5'd0; e_rd_sel = 5'b01000; e_frd_en = 1'b1;
+    expect_reads(1'b1, 1'b0);
+    e_op2_sel = 1'b1; e_dmem_ren = 1'b1; e_dmem_memw = 1'b1; e_dmem_align = 2'b11;
+    e_immediate = 32'hFFFF_FFFC; e_imm_valid = 1'b1;
+    check("flw f7, -4(x10): like lw, FP rd, o_rd = 0");
+
+    inst = enc_i(12'h010, 5'd2, 3'b010, 5'd0, OPC_LOADFP);
+    expect_defaults;
+    e_legal = 1'b1; e_rd_sel = 5'b01000; e_frd_en = 1'b1;
+    expect_reads(1'b1, 1'b0);
+    e_op2_sel = 1'b1; e_dmem_ren = 1'b1; e_dmem_memw = 1'b1; e_dmem_align = 2'b11;
+    e_immediate = 32'h10; e_imm_valid = 1'b1;
+    check("flw f0, 16(x2): f0 is a real register");
+
+    inst = enc_s(12'h024, 5'd9, 5'd3, 3'b010, OPC_STOREFP);
+    expect_defaults;
+    e_legal = 1'b1; e_frs2_en = 1'b1;
+    expect_reads(1'b1, 1'b0);   // the data register is FP, not x9
+    e_op2_sel = 1'b1; e_dmem_wen = 1'b1; e_dmem_memw = 1'b1; e_dmem_align = 2'b11;
+    e_immediate = 32'h24; e_imm_valid = 1'b1;
+    check("fsw f9, 36(x3): FP data register, integer base");
+
+    inst = enc_i(12'h010, 5'd2, 3'b011, 5'd1, OPC_LOADFP); expect_defaults; check("LOAD-FP funct3=011 (fld, illegal)");
+    inst = enc_i(12'h010, 5'd2, 3'b000, 5'd1, OPC_LOADFP); expect_defaults; check("LOAD-FP funct3=000 (illegal)");
+    inst = enc_s(12'h004, 5'd5, 5'd1, 3'b011, OPC_STOREFP); expect_defaults; check("STORE-FP funct3=011 (fsd, illegal)");
+    inst = enc_s(12'h004, 5'd5, 5'd1, 3'b001, OPC_STOREFP); expect_defaults; check("STORE-FP funct3=001 (illegal)");
+
+    // ================================================================
+    $display("--- OP-FP arithmetic (phase_6.pdf 4.7.2) ---");
+    // ================================================================
+    inst = enc_r(7'b0000000, 5'd2, 5'd1, 3'b000, 5'd3, OPC_OPFP); expect_defaults; expect_fpu_frd(1,1,0,0); check("fadd.s f3, f1, f2, rne");
+    inst = enc_r(7'b0000100, 5'd2, 5'd1, 3'b001, 5'd3, OPC_OPFP); expect_defaults; expect_fpu_frd(1,1,0,0); check("fsub.s f3, f1, f2, rtz");
+    inst = enc_r(7'b0001000, 5'd2, 5'd1, 3'b100, 5'd3, OPC_OPFP); expect_defaults; expect_fpu_frd(1,1,0,0); check("fmul.s f3, f1, f2, rmm");
+    inst = enc_r(7'b0001100, 5'd2, 5'd1, 3'b111, 5'd3, OPC_OPFP); expect_defaults; expect_fpu_frd(1,1,0,0); check("fdiv.s f3, f1, f2, dyn (legal at decode)");
+    inst = enc_r(7'b0101100, 5'd0, 5'd1, 3'b010, 5'd0, OPC_OPFP); expect_defaults; expect_fpu_frd(1,0,0,0); check("fsqrt.s f0, f1, rdn");
+    inst = enc_r(7'b0000000, 5'd2, 5'd1, 3'b101, 5'd3, OPC_OPFP); expect_defaults; check("fadd.s rm=101 (reserved, illegal)");
+    inst = enc_r(7'b0001100, 5'd2, 5'd1, 3'b110, 5'd3, OPC_OPFP); expect_defaults; check("fdiv.s rm=110 (reserved, illegal)");
+    inst = enc_r(7'b0101100, 5'd1, 5'd1, 3'b000, 5'd3, OPC_OPFP); expect_defaults; check("fsqrt.s rs2=00001 (illegal)");
+    inst = enc_r(7'b0000001, 5'd2, 5'd1, 3'b000, 5'd3, OPC_OPFP); expect_defaults; check("fadd.d (fmt=01, illegal)");
+
+    // ================================================================
+    $display("--- fused multiply-add (phase_6.pdf 4.7.3) ---");
+    // ================================================================
+    inst = enc_r4(5'd4, 2'b00, 5'd2, 5'd1, 3'b000, 5'd5, OPC_MADD);  expect_defaults; expect_fpu_frd(1,1,1,0); check("fmadd.s f5, f1, f2, f4");
+    inst = enc_r4(5'd31,2'b00, 5'd30,5'd29,3'b011, 5'd28,OPC_MSUB);  expect_defaults; expect_fpu_frd(1,1,1,0); check("fmsub.s f28, f29, f30, f31, rup");
+    inst = enc_r4(5'd0, 2'b00, 5'd0, 5'd0, 3'b111, 5'd0, OPC_NMSUB); expect_defaults; expect_fpu_frd(1,1,1,0); check("fnmsub.s f0, f0, f0, f0, dyn");
+    inst = enc_r4(5'd9, 2'b00, 5'd8, 5'd7, 3'b100, 5'd6, OPC_NMADD); expect_defaults; expect_fpu_frd(1,1,1,0); check("fnmadd.s f6, f7, f8, f9, rmm");
+    inst = enc_r4(5'd4, 2'b01, 5'd2, 5'd1, 3'b000, 5'd5, OPC_MADD);  expect_defaults; check("fmadd.d (fmt=01, illegal)");
+    inst = enc_r4(5'd4, 2'b11, 5'd2, 5'd1, 3'b000, 5'd5, OPC_NMADD); expect_defaults; check("fnmadd.q (fmt=11, illegal)");
+    inst = enc_r4(5'd4, 2'b00, 5'd2, 5'd1, 3'b101, 5'd5, OPC_MSUB);  expect_defaults; check("fmsub.s rm=101 (illegal)");
+    inst = enc_r4(5'd4, 2'b00, 5'd2, 5'd1, 3'b110, 5'd5, OPC_NMSUB); expect_defaults; check("fnmsub.s rm=110 (illegal)");
+
+    // ================================================================
+    $display("--- sign injection, min/max (phase_6.pdf 4.7.4-4.7.5) ---");
+    // ================================================================
+    inst = enc_r(7'b0010000, 5'd2, 5'd1, 3'b000, 5'd3, OPC_OPFP); expect_defaults; expect_fpu_frd(1,1,0,0); check("fsgnj.s f3, f1, f2");
+    inst = enc_r(7'b0010000, 5'd2, 5'd1, 3'b001, 5'd3, OPC_OPFP); expect_defaults; expect_fpu_frd(1,1,0,0); check("fsgnjn.s f3, f1, f2");
+    inst = enc_r(7'b0010000, 5'd2, 5'd2, 3'b010, 5'd3, OPC_OPFP); expect_defaults; expect_fpu_frd(1,1,0,0); check("fsgnjx.s f3, f2, f2 (fabs.s)");
+    inst = enc_r(7'b0010000, 5'd2, 5'd1, 3'b011, 5'd3, OPC_OPFP); expect_defaults; check("fsgnj funct3=011 (illegal)");
+    inst = enc_r(7'b0010100, 5'd2, 5'd1, 3'b000, 5'd3, OPC_OPFP); expect_defaults; expect_fpu_frd(1,1,0,0); check("fmin.s f3, f1, f2");
+    inst = enc_r(7'b0010100, 5'd2, 5'd1, 3'b001, 5'd3, OPC_OPFP); expect_defaults; expect_fpu_frd(1,1,0,0); check("fmax.s f3, f1, f2");
+    inst = enc_r(7'b0010100, 5'd2, 5'd1, 3'b010, 5'd3, OPC_OPFP); expect_defaults; check("fmin/fmax funct3=010 (illegal)");
+
+    // ================================================================
+    $display("--- compare, classify, moves, conversions ---");
+    // ================================================================
+    inst = enc_r(7'b1010000, 5'd2, 5'd1, 3'b010, 5'd5, OPC_OPFP); expect_defaults; expect_fpu_xrd(1,1,0); check("feq.s x5, f1, f2");
+    inst = enc_r(7'b1010000, 5'd2, 5'd1, 3'b001, 5'd5, OPC_OPFP); expect_defaults; expect_fpu_xrd(1,1,0); check("flt.s x5, f1, f2");
+    inst = enc_r(7'b1010000, 5'd2, 5'd1, 3'b000, 5'd0, OPC_OPFP); expect_defaults; expect_fpu_xrd(1,1,0); check("fle.s x0, f1, f2");
+    inst = enc_r(7'b1010000, 5'd2, 5'd1, 3'b011, 5'd5, OPC_OPFP); expect_defaults; check("compare funct3=011 (illegal)");
+    inst = enc_r(7'b1110000, 5'd0, 5'd1, 3'b001, 5'd5, OPC_OPFP); expect_defaults; expect_fpu_xrd(1,0,0); check("fclass.s x5, f1");
+    inst = enc_r(7'b1110000, 5'd0, 5'd1, 3'b000, 5'd5, OPC_OPFP); expect_defaults; expect_fpu_xrd(1,0,0); check("fmv.x.w x5, f1");
+    inst = enc_r(7'b1110000, 5'd1, 5'd1, 3'b001, 5'd5, OPC_OPFP); expect_defaults; check("fclass.s rs2=00001 (illegal)");
+    inst = enc_r(7'b1110000, 5'd0, 5'd1, 3'b010, 5'd5, OPC_OPFP); expect_defaults; check("fmv.x.w funct3=010 (illegal)");
+    inst = enc_r(7'b1100000, 5'd0, 5'd1, 3'b001, 5'd5, OPC_OPFP); expect_defaults; expect_fpu_xrd(1,0,0); check("fcvt.w.s x5, f1, rtz");
+    inst = enc_r(7'b1100000, 5'd1, 5'd1, 3'b111, 5'd5, OPC_OPFP); expect_defaults; expect_fpu_xrd(1,0,0); check("fcvt.wu.s x5, f1, dyn");
+    inst = enc_r(7'b1100000, 5'd2, 5'd1, 3'b000, 5'd5, OPC_OPFP); expect_defaults; check("fcvt.l.s (rs2=00010, RV64 only, illegal)");
+    inst = enc_r(7'b1100000, 5'd0, 5'd1, 3'b101, 5'd5, OPC_OPFP); expect_defaults; check("fcvt.w.s rm=101 (illegal)");
+    inst = enc_r(7'b1101000, 5'd0, 5'd11,3'b000, 5'd5, OPC_OPFP); expect_defaults; expect_fpu_frd(0,0,0,1); check("fcvt.s.w f5, x11 (integer rs1)");
+    inst = enc_r(7'b1101000, 5'd1, 5'd11,3'b100, 5'd5, OPC_OPFP); expect_defaults; expect_fpu_frd(0,0,0,1); check("fcvt.s.wu f5, x11, rmm");
+    inst = enc_r(7'b1101000, 5'd3, 5'd11,3'b000, 5'd5, OPC_OPFP); expect_defaults; check("fcvt.s.lu (rs2=00011, illegal)");
+    inst = enc_r(7'b1101000, 5'd0, 5'd11,3'b110, 5'd5, OPC_OPFP); expect_defaults; check("fcvt.s.w rm=110 (illegal)");
+    inst = enc_r(7'b1111000, 5'd0, 5'd12,3'b000, 5'd5, OPC_OPFP); expect_defaults; expect_fpu_frd(0,0,0,1); check("fmv.w.x f5, x12 (integer rs1)");
+    inst = enc_r(7'b1111000, 5'd0, 5'd12,3'b001, 5'd5, OPC_OPFP); expect_defaults; check("fmv.w.x funct3=001 (illegal)");
+    inst = enc_r(7'b1111000, 5'd4, 5'd12,3'b000, 5'd5, OPC_OPFP); expect_defaults; check("fmv.w.x rs2=00100 (illegal)");
+
+    // ================================================================
+    $display("--- CSR instructions on fcsr (phase_6.pdf 4.6.2) ---");
+    // ================================================================
+    // register forms read x[rs1]; i forms take uimm from the same field
+    inst = enc_i(12'h003, 5'd6, 3'b001, 5'd5, OPC_SYSTEM); expect_defaults; expect_fpu_xrd(0,0,1); check("csrrw x5, fcsr, x6");
+    inst = enc_i(12'h001, 5'd0, 3'b010, 5'd12, OPC_SYSTEM); expect_defaults; expect_fpu_xrd(0,0,1); check("csrrs x12, fflags, x0 (frflags)");
+    inst = enc_i(12'h002, 5'd7, 3'b011, 5'd0, OPC_SYSTEM); expect_defaults; expect_fpu_xrd(0,0,1); check("csrrc x0, frm, x7");
+    inst = enc_i(12'h002, 5'd1, 3'b101, 5'd0, OPC_SYSTEM); expect_defaults; expect_fpu_xrd(0,0,0); check("csrrwi x0, frm, 1 (no integer read)");
+    inst = enc_i(12'h001, 5'd31,3'b110, 5'd8, OPC_SYSTEM); expect_defaults; expect_fpu_xrd(0,0,0); check("csrrsi x8, fflags, 31");
+    inst = enc_i(12'h003, 5'd4, 3'b111, 5'd9, OPC_SYSTEM); expect_defaults; expect_fpu_xrd(0,0,0); check("csrrci x9, fcsr, 4");
+    inst = enc_i(12'h000, 5'd6, 3'b001, 5'd5, OPC_SYSTEM); expect_defaults; check("csrrw on CSR 0x000 (illegal)");
+    inst = enc_i(12'h004, 5'd6, 3'b010, 5'd5, OPC_SYSTEM); expect_defaults; check("csrrs on CSR 0x004 (illegal)");
+    inst = enc_i(12'hC00, 5'd0, 3'b010, 5'd5, OPC_SYSTEM); expect_defaults; check("rdcycle (CSR 0xC00, illegal)");
+    inst = enc_i(12'h300, 5'd6, 3'b001, 5'd5, OPC_SYSTEM); expect_defaults; check("csrrw mstatus (illegal)");
+    inst = enc_i(12'h103, 5'd6, 3'b001, 5'd5, OPC_SYSTEM); expect_defaults; check("csrrw CSR 0x103 (low bits match, illegal)");
+    inst = enc_i(12'h003, 5'd6, 3'b100, 5'd5, OPC_SYSTEM); expect_defaults; check("SYSTEM funct3=100 on fcsr (illegal)");
+    inst = 32'h00100073; expect_defaults; e_legal = 1'b1; e_halt = 1'b1; check("ebreak still halts");
+
+    // ================================================================
+    $display("--- exhaustive OP-FP sweep (funct7 x funct3 x rs2) ---");
+    // ================================================================
+    sw_bad = 0; sw_n = 0;
+    for (a = 0; a < 128; a = a + 1)
+      for (b = 0; b < 8; b = b + 1)
+        for (c = 0; c < 32; c = c + 1) begin
+          inst = enc_r(a[6:0], c[4:0], 5'd17, b[2:0], 5'd9, OPC_OPFP);
+          r = ref_opfp(a[6:0], b[2:0], c[4:0]);
+          // r = {legal, frd, frs1, frs2, xrs1}
+          sweep_check(r[4], r[4], r[2], r[1], 1'b0, r[3] & r[4], r[0],
+                      (r[4] & ~r[3]) ? 5'b10000 : 5'b00000,
+                      (r[4] & ~r[3]) ? 5'd9 : 5'd0);
+        end
+    if (sw_bad == 0) begin pass_count = pass_count + 1; $display("[PASS] %0d OP-FP encodings match the legality model", sw_n); end
+    else begin fail_count = fail_count + 1; $display("[FAIL] OP-FP sweep: %0d of %0d mismatched", sw_bad, sw_n); end
+
+    $display("--- exhaustive fused sweep (opcode x fmt x rm) ---");
+    sw_bad = 0; sw_n = 0;
+    for (a = 0; a < 4; a = a + 1)
+      for (b = 0; b < 4; b = b + 1)
+        for (c = 0; c < 8; c = c + 1) begin
+          inst = enc_r4(5'd3, b[1:0], 5'd2, 5'd1, c[2:0], 5'd4, {3'b100, a[1:0], 2'b11});
+          sweep_check((b == 0) && (c != 5) && (c != 6), (b == 0) && (c != 5) && (c != 6),
+                      (b == 0) && (c != 5) && (c != 6), (b == 0) && (c != 5) && (c != 6),
+                      (b == 0) && (c != 5) && (c != 6), (b == 0) && (c != 5) && (c != 6),
+                      1'b0, 5'b00000, 5'd0);
+        end
+    if (sw_bad == 0) begin pass_count = pass_count + 1; $display("[PASS] %0d fused encodings match the legality model", sw_n); end
+    else begin fail_count = fail_count + 1; $display("[FAIL] fused sweep: %0d of %0d mismatched", sw_bad, sw_n); end
+
+    $display("--- exhaustive CSR sweep (address x funct3) ---");
+    sw_bad = 0; sw_n = 0;
+    for (a = 0; a < 4096; a = a + 1)
+      for (b = 1; b < 8; b = b + 1) begin
+        if (b != 4) begin
+          inst = enc_i(a[11:0], 5'd6, b[2:0], 5'd5, OPC_SYSTEM);
+          if (a >= 1 && a <= 3)
+            sweep_check(1'b1, 1'b1, 1'b0, 1'b0, 1'b0, 1'b0, ~b[2], 5'b10000, 5'd5);
+          else
+            sweep_check(1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 5'b00000, 5'd0);
+        end
+      end
+    if (sw_bad == 0) begin pass_count = pass_count + 1; $display("[PASS] %0d CSR encodings: only fflags/frm/fcsr are legal", sw_n); end
+    else begin fail_count = fail_count + 1; $display("[FAIL] CSR sweep: %0d of %0d mismatched", sw_bad, sw_n); end
+
+    $display("--- exhaustive OP funct7 sweep (RV32I vs RV32M vs illegal) ---");
+    sw_bad = 0; sw_n = 0;
+    for (a = 0; a < 128; a = a + 1)
+      for (b = 0; b < 8; b = b + 1) begin
+        inst = enc_r(a[6:0], 5'd3, 5'd2, b[2:0], 5'd1, OPC_OP);
+        #1;
+        sw_n = sw_n + 1;
+        if (o_legal !== ((a == 0) || (a == 1) || (a == 32 && (b == 0 || b == 5))) ||
+            o_mext !== (a == 1) || o_fpu !== 1'b0 || o_frd_en !== 1'b0 ||
+            o_rd !== (o_legal ? 5'd1 : 5'd0)) begin
+          sw_bad = sw_bad + 1;
+          if (sw_bad <= 10) $display("[FAIL] OP sweep inst=%08h legal=%b mext=%b rd=%0d", inst, o_legal, o_mext, o_rd);
+        end
+      end
+    if (sw_bad == 0) begin pass_count = pass_count + 1; $display("[PASS] %0d OP encodings classified correctly", sw_n); end
+    else begin fail_count = fail_count + 1; $display("[FAIL] OP sweep: %0d of %0d mismatched", sw_bad, sw_n); end
+
     // ================================================================
     $display("=======================================");
     $display("%0d passed, %0d failed", pass_count, fail_count);
     if (fail_count == 0) $display("ALL TESTS PASSED");
-    else                 $display("THERE WERE FAILURES");
+    else                 $display("TEST FAILED");
     $finish;
   end
 
