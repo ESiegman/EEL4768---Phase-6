@@ -13,9 +13,16 @@ module alu_tb;
     reg  [31:0] op1;
     reg  [31:0] op2;
 
+    // phase 6: clock/reset and the RV32M handshake
+    reg         clk;
+    reg         rst;
+    reg         mext;
+    reg         advance;
+
     wire [31:0] result;
     wire        eq;
     wire        slt;
+    wire        busy;
 
     integer passed;
     integer failed;
@@ -30,6 +37,11 @@ module alu_tb;
     localparam [2:0] OP_AND  = 3'b111;
 
     alu dut (
+        .i_clk      (clk),
+        .i_rst      (rst),
+        .i_mext     (mext),
+        .i_advance  (advance),
+        .o_busy     (busy),
         .i_opsel    (opsel),
         .i_sub      (sub),
         .i_unsigned (is_unsigned),
@@ -63,7 +75,7 @@ module alu_tb;
             op2         = t_op2;
             #1;  // combinational, one step is enough to settle
 
-            if (result === want_result && eq === want_eq && slt === want_slt) begin
+            if (result === want_result && eq === want_eq && slt === want_slt && busy === 1'b0) begin
                 passed = passed + 1;
                 $display("[PASS] %0s", label);
             end else begin
@@ -71,8 +83,8 @@ module alu_tb;
                 $display("[FAIL] %0s", label);
                 $display("         opsel=%b sub=%b unsigned=%b arith=%b op1=%h op2=%h",
                          t_opsel, t_sub, t_unsigned, t_arith, t_op1, t_op2);
-                $display("         result=%h (want %h)  eq=%b (want %b)  slt=%b (want %b)",
-                         result, want_result, eq, want_eq, slt, want_slt);
+                $display("         result=%h (want %h)  eq=%b (want %b)  slt=%b (want %b)  busy=%b (want 0)",
+                         result, want_result, eq, want_eq, slt, want_slt, busy);
             end
         end
     endtask
@@ -145,6 +157,149 @@ module alu_tb;
         end
     endfunction
 
+
+    // ------------------------------------------------------------------
+    // RV32M (phase_6.pdf 4.3, 5.1)
+    // ------------------------------------------------------------------
+    localparam [2:0] M_MUL    = 3'b000;
+    localparam [2:0] M_MULH   = 3'b001;
+    localparam [2:0] M_MULHSU = 3'b010;
+    localparam [2:0] M_MULHU  = 3'b011;
+    localparam [2:0] M_DIV    = 3'b100;
+    localparam [2:0] M_DIVU   = 3'b101;
+    localparam [2:0] M_REM    = 3'b110;
+    localparam [2:0] M_REMU   = 3'b111;
+
+    always #5 clk = ~clk;
+
+    // Reference model straight from the spec table, using the simulator's
+    // * / % (fine in a testbench, never in the RTL).
+    function [31:0] model_m;
+        input [ 2:0] f3;
+        input [31:0] a;
+        input [31:0] b;
+        reg   [63:0] p;
+        reg signed [31:0] sa, sb, sq, sr;
+        begin
+            // Signed quotient/remainder in their own statements: inside a
+            // ?: with unsigned operands, $signed(a) / $signed(b) would be
+            // evaluated unsigned.
+            sa = a;
+            sb = b;
+            sq = 0;
+            sr = 0;
+            if (b != 0 && !(a == 32'h8000_0000 && b == 32'hFFFF_FFFF)) begin
+                sq = sa / sb;   // Verilog truncates toward zero
+                sr = sa % sb;   // and the remainder takes the dividend's sign
+            end
+            case (f3)
+                M_MUL:    begin p = a * b; model_m = p[31:0]; end
+                M_MULH:   begin p = {{32{a[31]}}, a} * {{32{b[31]}}, b}; model_m = p[63:32]; end
+                M_MULHSU: begin p = {{32{a[31]}}, a} * {32'd0, b};       model_m = p[63:32]; end
+                M_MULHU:  begin p = {32'd0, a} * {32'd0, b};             model_m = p[63:32]; end
+                M_DIV:    model_m = (b == 0) ? 32'hFFFF_FFFF :
+                                    (a == 32'h8000_0000 && b == 32'hFFFF_FFFF) ? 32'h8000_0000 : sq;
+                M_DIVU:   model_m = (b == 0) ? 32'hFFFF_FFFF : a / b;
+                M_REM:    model_m = (b == 0) ? a :
+                                    (a == 32'h8000_0000 && b == 32'hFFFF_FFFF) ? 32'd0 : sr;
+                default:  model_m = (b == 0) ? a : a % b;
+            endcase
+        end
+    endfunction
+
+    integer m_cycles;
+    integer m_max_cycles;
+    reg [31:0] m_held;
+    reg        m_ok;
+    reg        m_b0;
+
+    // Run one M instruction through the handshake, the way the hart does:
+    // i_mext stays high and i_advance low while o_busy is high, then
+    // `freeze` extra cycles with i_advance low stand in for a cache miss
+    // that keeps the finished instruction in EX, then one advance edge.
+    // Checks: o_busy is high on the first cycle and drops within the time
+    // limit; o_busy has no combinational path from i_advance; the result is
+    // right and held through the freeze; o_busy never rises again (no
+    // restart). Starts and ends just after a negedge.
+    task m_case;
+        input [511:0] label;
+        input [  2:0] f3;
+        input [ 31:0] a;
+        input [ 31:0] b;
+        input integer freeze;
+        reg   [ 31:0] want_m;
+        begin
+            want_m = model_m(f3, a, b);
+            m_ok   = 1'b1;
+            mext = 1'b1; advance = 1'b0;
+            opsel = f3; op1 = a; op2 = b;
+            sub = 1'b0; is_unsigned = 1'b0; arith = 1'b0;
+            #1;
+            if (busy !== 1'b1) begin
+                m_ok = 1'b0;
+                $display("         o_busy not high on the first cycle");
+            end
+            m_b0 = busy; advance = 1'b1; #1;
+            if (busy !== m_b0) begin
+                m_ok = 1'b0;
+                $display("         o_busy depends on i_advance");
+            end
+            advance = 1'b0;
+            m_cycles = 0;
+            while (busy === 1'b1 && m_cycles < 100) begin
+                @(negedge clk);
+                m_cycles = m_cycles + 1;
+            end
+            if (busy !== 1'b0) begin
+                m_ok = 1'b0;
+                $display("         o_busy stuck high or X after %0d cycles", m_cycles);
+            end
+            if (m_cycles > m_max_cycles) m_max_cycles = m_cycles;
+            m_held = result;
+            if (m_held !== want_m) begin
+                m_ok = 1'b0;
+                $display("         result=%h (want %h)", m_held, want_m);
+            end
+            repeat (freeze) begin
+                @(negedge clk);
+                if (busy !== 1'b0) begin
+                    m_ok = 1'b0;
+                    $display("         o_busy rose again while held (restart)");
+                end
+                if (result !== m_held) begin
+                    m_ok = 1'b0;
+                    $display("         result changed while held: %h -> %h", m_held, result);
+                end
+            end
+            advance = 1'b1;
+            @(negedge clk);
+            advance = 1'b0;
+            if (m_ok) passed = passed + 1;
+            else begin
+                failed = failed + 1;
+                $display("[FAIL] %0s: f3=%b op1=%h op2=%h", label, f3, a, b);
+            end
+        end
+    endtask
+
+    // Directed vector: print a PASS line too.
+    task m_check;
+        input [511:0] label;
+        input [  2:0] f3;
+        input [ 31:0] a;
+        input [ 31:0] b;
+        input [ 31:0] want_m;
+        begin
+            if (model_m(f3, a, b) !== want_m) begin
+                failed = failed + 1;
+                $display("[FAIL] %0s: testbench model gives %h, table says %h", label, model_m(f3, a, b), want_m);
+            end
+            k = failed;
+            m_case(label, f3, a, b, 0);
+            if (failed == k) $display("[PASS] %0s", label);
+        end
+    endtask
+
     integer i;
     integer k;
     integer seed;
@@ -159,7 +314,15 @@ module alu_tb;
 
         passed = 0;
         failed = 0;
+        clk = 1'b0;
+        rst = 1'b1;
+        mext = 1'b0;
+        advance = 1'b1;
+        m_max_cycles = 0;
         $display("========== alu testbench ==========");
+        @(negedge clk);
+        @(negedge clk);
+        rst = 1'b0;
 
         // add / sub, carry out is discarded so results wrap
         $display("--- add/sub ---");
@@ -387,6 +550,101 @@ module alu_tb;
             end else passed = passed + 1;
         end
         $display("       300 narrow-operand vectors checked against the model");
+
+
+        // --------------------------------------------------------------
+        $display("--- RV32M directed (phase_6.pdf 4.3) ---");
+        @(negedge clk);
+        m_check("mul: 11 * 13 = 143",                   M_MUL,    32'd11,        32'd13,        32'd143);
+        m_check("mul: 0xFFFFFFFF * 0xFFFFFFFF low",     M_MUL,    32'hFFFF_FFFF, 32'hFFFF_FFFF, 32'h0000_0001);
+        m_check("mulh: -1 * -1 high = 0",               M_MULH,   32'hFFFF_FFFF, 32'hFFFF_FFFF, 32'h0000_0000);
+        m_check("mulhsu: -1 * (2^32-1) high",           M_MULHSU, 32'hFFFF_FFFF, 32'hFFFF_FFFF, 32'hFFFF_FFFF);
+        m_check("mulhu: (2^32-1)^2 high",               M_MULHU,  32'hFFFF_FFFF, 32'hFFFF_FFFF, 32'hFFFF_FFFE);
+        m_check("mul: -7 * 3 = -21",                    M_MUL,    32'hFFFF_FFF9, 32'd3,         32'hFFFF_FFEB);
+        m_check("mulh: -2^31 * -2^31 high = 2^30",      M_MULH,   32'h8000_0000, 32'h8000_0000, 32'h4000_0000);
+        m_check("mulh: -2^31 * 1 high = -1",            M_MULH,   32'h8000_0000, 32'd1,         32'hFFFF_FFFF);
+        m_check("mulhsu: -2^31 * 0x80000000 high",      M_MULHSU, 32'h8000_0000, 32'h8000_0000, 32'hC000_0000);
+        m_check("mulhsu: positive * 0xFFFFFFFF high",   M_MULHSU, 32'd2,         32'hFFFF_FFFF, 32'h0000_0001);
+        m_check("mul: x * 0 = 0",                       M_MUL,    32'h1234_5678, 32'd0,         32'd0);
+        m_check("mulh: negative * 0 = 0 (no -0 issue)", M_MULH,   32'hFFFF_FFF0, 32'd0,         32'd0);
+        m_check("div: 7 / -3 = -2",                     M_DIV,    32'd7,         32'hFFFF_FFFD, 32'hFFFF_FFFE);
+        m_check("rem: 7 % -3 = 1",                      M_REM,    32'd7,         32'hFFFF_FFFD, 32'd1);
+        m_check("div: -7 / 3 = -2",                     M_DIV,    32'hFFFF_FFF9, 32'd3,         32'hFFFF_FFFE);
+        m_check("rem: -7 % 3 = -1",                     M_REM,    32'hFFFF_FFF9, 32'd3,         32'hFFFF_FFFF);
+        m_check("div: -7 / -3 = 2",                     M_DIV,    32'hFFFF_FFF9, 32'hFFFF_FFFD, 32'd2);
+        m_check("rem: -7 % -3 = -1",                    M_REM,    32'hFFFF_FFF9, 32'hFFFF_FFFD, 32'hFFFF_FFFF);
+        m_check("divu: 13 / 3 = 4",                     M_DIVU,   32'd13,        32'd3,         32'd4);
+        m_check("remu: 13 % 3 = 1",                     M_REMU,   32'd13,        32'd3,         32'd1);
+        m_check("divu: 0xFFFFFFFF / 2",                 M_DIVU,   32'hFFFF_FFFF, 32'd2,         32'h7FFF_FFFF);
+        m_check("div by zero: 5 / 0 = -1",              M_DIV,    32'd5,         32'd0,         32'hFFFF_FFFF);
+        m_check("div by zero: -5 / 0 = -1 (no sign fix)", M_DIV,  32'hFFFF_FFFB, 32'd0,         32'hFFFF_FFFF);
+        m_check("divu by zero = 0xFFFFFFFF",            M_DIVU,   32'h8000_0000, 32'd0,         32'hFFFF_FFFF);
+        m_check("rem by zero: -5 % 0 = -5",             M_REM,    32'hFFFF_FFFB, 32'd0,         32'hFFFF_FFFB);
+        m_check("remu by zero: x % 0 = x",              M_REMU,   32'hDEAD_BEEF, 32'd0,         32'hDEAD_BEEF);
+        m_check("div overflow: -2^31 / -1 = -2^31",     M_DIV,    32'h8000_0000, 32'hFFFF_FFFF, 32'h8000_0000);
+        m_check("rem overflow: -2^31 % -1 = 0",         M_REM,    32'h8000_0000, 32'hFFFF_FFFF, 32'd0);
+        m_check("divu: -2^31 / -1 as unsigned = 0",     M_DIVU,   32'h8000_0000, 32'hFFFF_FFFF, 32'd0);
+        m_check("remu: 0x80000000 % 0xFFFFFFFF",        M_REMU,   32'h8000_0000, 32'hFFFF_FFFF, 32'h8000_0000);
+        m_check("div: -2^31 / 1",                       M_DIV,    32'h8000_0000, 32'd1,         32'h8000_0000);
+        m_check("div: -2^31 / 2",                       M_DIV,    32'h8000_0000, 32'd2,         32'hC000_0000);
+        m_check("div: small / large = 0",               M_DIV,    32'd3,         32'd1000,      32'd0);
+        m_check("rem: small % large = small",           M_REM,    32'hFFFF_FFFD, 32'd1000,      32'hFFFF_FFFD);
+        m_check("div: x / x = 1",                       M_DIV,    32'h7FFF_FFFF, 32'h7FFF_FFFF, 32'd1);
+
+        $display("--- RV32M hold through a freeze (phase_6.pdf 5.5.3) ---");
+        k = failed;
+        m_case("mul held 5 cycles",    M_MUL,    32'h0001_0003, 32'h0002_0005, 5);
+        m_case("mulh held 3 cycles",   M_MULH,   32'hDEAD_BEEF, 32'h1234_5678, 3);
+        m_case("div held 7 cycles",    M_DIV,    32'h8000_0001, 32'h0000_0007, 7);
+        m_case("remu held 1 cycle",    M_REMU,   32'hFFFF_FFFF, 32'h0000_0010, 1);
+        m_case("div/0 held 4 cycles",  M_DIV,    32'hFFFF_FF00, 32'd0,         4);
+        if (failed == k) $display("[PASS] results held, no restart, while i_advance low");
+
+        $display("--- RV32M back to back ---");
+        // m_case ends with i_mext still high and the next one starts right
+        // after the advance edge, so these run with no idle cycle between.
+        k = failed;
+        m_case("b2b mul",   M_MUL,  32'd100,       32'd200,       0);
+        m_case("b2b div",   M_DIV,  32'hFFFF_FC18, 32'd7,         0);
+        m_case("b2b mulhu", M_MULHU,32'hFFFF_FFFF, 32'h8000_0000, 2);
+        m_case("b2b rem",   M_REM,  32'h7FFF_FFFF, 32'hFFFF_FFF0, 0);
+        m_case("b2b mul",   M_MUL,  32'hFFFF_FFFF, 32'd2,         0);
+        if (failed == k) $display("[PASS] back-to-back M instructions restart cleanly");
+
+        // An RV32I op right after an M op: combinational again, busy low.
+        mext = 1'b0; advance = 1'b1;
+        check("add right after an M op",       OP_ADD, 1'b0,1'b0,1'b0, 32'd5,         32'd6,         32'd11,        1'b0,1'b1);
+
+        $display("--- RV32M reset mid-operation ---");
+        mext = 1'b1; advance = 1'b0; opsel = M_DIV; op1 = 32'd100; op2 = 32'd3;
+        repeat (5) @(negedge clk);
+        rst = 1'b1; mext = 1'b0;
+        @(negedge clk);
+        rst = 1'b0;
+        k = failed;
+        m_case("div after reset",  M_DIV, 32'd100, 32'd3, 0);
+        if (failed == k) $display("[PASS] a reset mid-divide does not corrupt the next operation");
+
+        $display("--- RV32M random vs model ---");
+        seed = 32'd4768;
+        for (i = 0; i < 400; i = i + 1) begin
+            r_opsel = $random(seed);
+            r_op1   = $random(seed);
+            r_op2   = $random(seed);
+            // mix in small, zero and extreme operands
+            case ($random(seed) & 7)
+                0: r_op2 = 32'd0;
+                1: r_op2 = $random(seed) & 32'hF;
+                2: r_op1 = 32'h8000_0000;
+                3: r_op2 = 32'hFFFF_FFFF;
+                default: ;
+            endcase
+            m_case("random M", r_opsel, r_op1, r_op2, $random(seed) & 3);
+        end
+        $display("       400 random M vectors checked against the model");
+        $display("       longest M operation: %0d busy cycles", m_max_cycles);
+        mext = 1'b0;
+        advance = 1'b1;
 
         $display("===================================");
         $display("%0d passed, %0d failed", passed, failed);

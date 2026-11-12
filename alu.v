@@ -3,9 +3,15 @@
 // The arithmetic logic unit (ALU) is responsible for performing the core
 // calculations of the processor. It takes two 32-bit operands and outputs
 // a 32 bit result based on the selection operation - addition, comparison,
-// shift, or logical operation. This ALU is a purely combinational block, so
-// you should not attempt to add any registers or pipeline it.
+// shift, or logical operation. Every RV32I operation is purely
+// combinational. In phase 6 the ALU also performs the RV32M multiply and
+// divide instructions, which may be combinational or take several cycles
+// (see `documentation/phase_6.pdf`).
 module alu (
+    // Global clock and synchronous active-high reset (used by an iterative
+    // multiplier or divider).
+    input  wire        i_clk,
+    input  wire        i_rst,
     // Major operation selection.
     // 3'b000: addition/subtraction if `i_sub` asserted
     // 3'b001: shift left logical
@@ -15,15 +21,32 @@ module alu (
     // 3'b101: shift right logical/arithmetic if `i_arith` asserted
     // 3'b110: or
     // 3'b111: and
+    // When `i_mext` is asserted, this is the M instruction's funct3 instead:
+    // 3'b000: mul    - low 32 bits of op1 * op2
+    // 3'b001: mulh   - high 32 bits of signed op1 * signed op2
+    // 3'b010: mulhsu - high 32 bits of signed op1 * unsigned op2
+    // 3'b011: mulhu  - high 32 bits of unsigned op1 * unsigned op2
+    // 3'b100: div    - signed op1 / op2, rounded toward zero
+    // 3'b101: divu   - unsigned op1 / op2
+    // 3'b110: rem    - signed remainder, same sign as op1
+    // 3'b111: remu   - unsigned remainder
     input  wire [ 2:0] i_opsel,
     // When asserted, addition operations should subtract instead.
     // This is only used for `i_opsel == 3'b000` (addition/subtraction).
     input  wire        i_sub,
     // When asserted, comparison operations should be treated as unsigned.
+    // This is only used for branch comparisons, as the set less than unsigned
+    // mode is already specified by `i_opsel`. For branch operations, the ALU
+    // result is not used, only the comparison results.
     input  wire        i_unsigned,
     // When asserted, right shifts should be treated as arithmetic instead of
     // logical. This is only used for `i_opsel == 3'b101` (shift right).
     input  wire        i_arith,
+    // Asserted while an RV32M instruction is in the execute stage.
+    input  wire        i_mext,
+    // Asserted when the instruction in the execute stage moves on at the next
+    // rising edge. A finished M result is held until then.
+    input  wire        i_advance,
     // First 32-bit input operand.
     input  wire [31:0] i_op1,
     // Second 32-bit input operand.
@@ -35,8 +58,12 @@ module alu (
     output wire        o_eq,
     // Set less than result. This is used downstream to determine if a
     // branch should be taken.
-    output wire        o_slt
+    output wire        o_slt,
+    // Asserted while an M operation is still running; the instruction must
+    // stay in the execute stage until it drops.
+    output wire        o_busy
 );
+
     // Your implementation goes under here
     // ------------------------------------
 
@@ -159,7 +186,107 @@ module alu (
         endcase
     end
 
-    assign o_result = result;
+    // ------------------------------------------------------------------
+    // RV32M: iterative shift-and-add multiplier and restoring divider
+    // (phase_6.pdf 4.3, 5.1). Both work on unsigned magnitudes, one bit per
+    // cycle, and fix the sign at the end (Figure 5).
+    //
+    //  * cycle 1: i_mext rises, o_busy goes high, operands are latched
+    //  * cycles 2-33: 32 steps
+    //  * then o_busy drops and the result is held until i_advance
+    // A finished result is never restarted, so a cache freeze that keeps
+    // the instruction in EX after it finishes cannot rerun it.
+    // ------------------------------------------------------------------
+    wire m_is_div = i_opsel[2];
+    // Which operands are signed: mulh, mulhsu, div, rem read rs1 as signed;
+    // mulh, div, rem read rs2 as signed. mul's low half is sign-agnostic.
+    wire m_op1_signed = (i_opsel == 3'b001) | (i_opsel == 3'b010) |
+                        (i_opsel == 3'b100) | (i_opsel == 3'b110);
+    wire m_op2_signed = (i_opsel == 3'b001) | (i_opsel == 3'b100) |
+                        (i_opsel == 3'b110);
+    wire m_neg1 = m_op1_signed & i_op1[31];
+    wire m_neg2 = m_op2_signed & i_op2[31];
+    // Two's complement magnitude. -2^31 stays 0x80000000, read as unsigned.
+    wire [31:0] m_mag1 = m_neg1 ? (~i_op1 + 32'd1) : i_op1;
+    wire [31:0] m_mag2 = m_neg2 ? (~i_op2 + 32'd1) : i_op2;
+    wire        m_div_zero = (i_op2 == 32'd0);
+
+    reg         m_running;
+    reg         m_done;
+    reg  [ 4:0] m_count;      // steps taken, 0..31
+    reg         m_div;        // latched: divide (1) or multiply (0)
+    reg  [ 1:0] m_sel;        // latched funct3[1:0]
+    reg         m_neg_main;   // negate the product / quotient
+    reg         m_neg_rem;    // negate the remainder
+    // Multiply: the multiplicand shifts left, the multiplier shifts right.
+    reg  [63:0] m_mcand;
+    reg  [31:0] m_mplier;
+    reg  [63:0] m_prod;
+    // Divide: {remainder, quotient} shift left together; the dividend
+    // starts in the quotient register and is shifted out as quotient bits
+    // are shifted in.
+    reg  [31:0] m_rem;
+    reg  [31:0] m_quo;
+    reg  [31:0] m_dvsr;
+
+    // One multiply step: add the multiplicand if the low multiplier bit is 1.
+    wire [63:0] m_prod_next = m_mplier[0] ? (m_prod + m_mcand) : m_prod;
+
+    // One restoring-division step: bring down the next dividend bit, and
+    // subtract the divisor if the partial remainder is at least the divisor.
+    wire [32:0] m_rem_shift = {m_rem, m_quo[31]};
+    wire        m_rem_ge    = (m_rem_shift >= {1'b0, m_dvsr});
+    wire [32:0] m_rem_sub   = m_rem_shift - {1'b0, m_dvsr};
+    wire [31:0] m_rem_next  = m_rem_ge ? m_rem_sub[31:0] : m_rem_shift[31:0];
+
+    wire        m_start = i_mext & ~m_running & ~m_done;
+
+    always @(posedge i_clk) begin
+        if (i_rst | i_advance | ~i_mext) begin
+            m_running <= 1'b0;
+            m_done    <= 1'b0;
+            m_count   <= 5'd0;
+        end else if (m_start) begin
+            m_running  <= 1'b1;
+            m_count    <= 5'd0;
+            m_div      <= m_is_div;
+            m_sel      <= i_opsel[1:0];
+            // Divide by zero: the unsigned divider already gives an all-ones
+            // quotient, so the quotient is never negated (x/0 = -1 for any
+            // sign of x). The remainder takes the dividend's sign.
+            m_neg_main <= m_is_div ? ((m_neg1 ^ m_neg2) & ~m_div_zero) : (m_neg1 ^ m_neg2);
+            m_neg_rem  <= m_neg1;
+            m_mcand    <= {32'd0, m_mag1};
+            m_mplier   <= m_mag2;
+            m_prod     <= 64'd0;
+            m_rem      <= 32'd0;
+            m_quo      <= m_mag1;
+            m_dvsr     <= m_mag2;
+        end else if (m_running) begin
+            m_count  <= m_count + 5'd1;
+            m_prod   <= m_prod_next;
+            m_mcand  <= {m_mcand[62:0], 1'b0};
+            m_mplier <= {1'b0, m_mplier[31:1]};
+            m_rem    <= m_rem_next;
+            m_quo    <= {m_quo[30:0], m_rem_ge};
+            if (m_count == 5'd31) begin
+                m_running <= 1'b0;
+                m_done    <= 1'b1;
+            end
+        end
+    end
+
+    // Sign correction and result selection.
+    wire [63:0] m_prod_fix = m_neg_main ? (~m_prod + 64'd1) : m_prod;
+    wire [31:0] m_quo_fix  = m_neg_main ? (~m_quo + 32'd1) : m_quo;
+    wire [31:0] m_rem_fix  = m_neg_rem  ? (~m_rem + 32'd1) : m_rem;
+    // mul -> low half; mulh/mulhsu/mulhu -> high half; div[u] -> quotient;
+    // rem[u] -> remainder.
+    wire [31:0] m_result = m_div ? (m_sel[1] ? m_rem_fix : m_quo_fix) :
+                                   ((m_sel == 2'b00) ? m_prod_fix[31:0] : m_prod_fix[63:32]);
+
+    assign o_busy   = i_mext & ~m_done;
+    assign o_result = i_mext ? m_result : result;
 
 endmodule
 
