@@ -35,8 +35,8 @@ module_sources() {
     case "$1" in
         decoder) echo "decoder.v imm.v" ;;
         cache)   echo "cache.v plru.v" ;;
-        fpu)     echo "fpu.v fpu_fma.v fpu_cvt.v fpu_round.v" ;;
-        hart)    echo "hart.v alu.v rf.v decoder.v imm.v cache.v plru.v fpu.v fpu_fma.v fpu_cvt.v fpu_round.v" ;;
+        fpu)     echo "fpu.v fpu_fma.v fpu_cvt.v fpu_round.v fpu_divsqrt.v" ;;
+        hart)    echo "hart.v alu.v rf.v decoder.v imm.v cache.v plru.v fpu.v fpu_fma.v fpu_cvt.v fpu_round.v fpu_divsqrt.v" ;;
         *)       echo "$1.v" ;;
     esac
 }
@@ -63,7 +63,14 @@ for name in alu imm rf decoder cache fpu hart; do
     svg="${OUT_DIR}/${name}.svg"
     log="${OUT_DIR}/${name}.yosys.log"
 
-    yosys_script="read_verilog -sv ${sources}; hierarchy -top ${name}; proc; opt; pmuxtree; opt_clean; write_json ${json}"
+    # Match the graded hart harness for the standalone cache diagram.
+    # Its 16-byte lines also keep recursive bus splitting tractable in
+    # netlistsvg; cache_tb still tests the wider hardware configurations.
+    parameters=""
+    if [[ "${name}" == "cache" ]]; then
+        parameters="chparam -set EVICT_POLICY 1 -set NUM_WAYS 4 -set CACHE_SIZE 2 -set BLOCK_SIZE 16 -set PREFETCH_EN 1 cache;"
+    fi
+    yosys_script="read_verilog -sv ${sources}; ${parameters} hierarchy -top ${name}; proc; opt; pmuxtree; opt_clean; write_json ${json}"
 
     if ! yosys -p "${yosys_script}" > "${log}" 2>&1; then
         echo "FAIL Schematic: ${name}  --  yosys synthesis error, see build/schematics/${name}.yosys.log"
@@ -71,7 +78,7 @@ for name in alu imm rf decoder cache fpu hart; do
         continue
     fi
 
-    if ! netlistsvg "${json}" -o "${svg}" >> "${log}" 2>&1; then
+    if ! node "${SCRIPT_DIR}/tools/render_schematic.cjs" "$(command -v netlistsvg)" "${json}" -o "${svg}" >> "${log}" 2>&1; then
         echo "FAIL Schematic: ${name}  --  netlistsvg render error, see build/schematics/${name}.yosys.log"
         overall_status=1
         continue

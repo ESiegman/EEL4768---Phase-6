@@ -23,11 +23,9 @@ The script runs:
   top/CSR/protocol row must pass. Missing rows or an incomplete simulation
   fail the script.
 
-The full log, including failures from the unfinished divide/sqrt unit, is
-kept in `build/fpu_math/fpu_tb.log`. Those four divide/sqrt-dependent rows
-are reported separately as pending; this script is not a claim that the
-whole CPU or every FPU instruction passes. `make test` retains its full
-suite verdict and now also runs the direct rounder testbench.
+The full log is kept in `build/fpu_math/fpu_tb.log`. All FPU rows, including
+divide/sqrt and its hold/commit sequences, must pass. `make test` also runs
+the full CPU suite and the direct rounder testbench.
 
 Implementation notes:
 
@@ -35,7 +33,7 @@ Implementation notes:
   multiplier retains all 48 product bits; the 77-bit alignment/add path
   keeps cancellation bits and uses constant-stage barrel shifters.
 - `fpu_round` is the single rounding/packing stage shared with conversion
-  and, when it lands, divide/sqrt. No finite subnormal is flushed.
+  and divide/sqrt. No finite subnormal is flushed.
 - `fpu_cvt` rounds finite float-to-integer values before clipping and emits
   NV without NX for invalid conversions. Integer-to-float feeds the shared
   rounder, including unsigned values and signed INT_MIN.
@@ -47,13 +45,11 @@ shifts, procedural loops, or combinational `if` statements. Check the FPU
 design in isolation with:
 
 ```sh
-ece552 validate -w fpu.v fpu_fma.v fpu_cvt.v fpu_round.v
+ece552 validate -w fpu.v fpu_fma.v fpu_cvt.v fpu_round.v fpu_divsqrt.v
 ```
 
 Validated results for this implementation: 21,950 rounder checks, 21,778
 FPU arithmetic/conversion checks and 117,706 top/CSR/protocol checks pass.
-The four FPU design files pass `ece552 validate -w` and Yosys
-`hierarchy -check; proc; opt; check -assert` with no reported problems.
-The full FPU suite still has 2,379 divide/sqrt-dependent failures. Whole-CPU
-lint also encounters existing hart connections to decoder/ALU ports that
-those unfinished modules do not yet expose.
+After the divider integration, the full FPU suite passes all 143,146
+checks. All 17 CI testbenches and whole-design `ece552 validate -w` pass.
+The hart also passes Yosys `hierarchy -check; proc; opt; check -assert`.

@@ -289,14 +289,15 @@ module alu_tb;
         input [ 31:0] a;
         input [ 31:0] b;
         input [ 31:0] want_m;
+        integer failures_before;
         begin
             if (model_m(f3, a, b) !== want_m) begin
                 failed = failed + 1;
                 $display("[FAIL] %0s: testbench model gives %h, table says %h", label, model_m(f3, a, b), want_m);
             end
-            k = failed;
+            failures_before = failed;
             m_case(label, f3, a, b, 0);
-            if (failed == k) $display("[PASS] %0s", label);
+            if (failed == failures_before) $display("[PASS] %0s", label);
         end
     endtask
 

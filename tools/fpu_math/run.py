@@ -2,7 +2,7 @@
 """Bowen's regression: integer-oracle rounder tests and existing TestFloat TB.
 
 No third-party Python packages. Requires iverilog/vvp (or explicit paths).
-Preserves the full FPU log, including the unfinished divide/sqrt failures.
+Preserves the full FPU log and requires divide/sqrt checks to pass too.
 """
 import argparse
 from pathlib import Path
@@ -122,14 +122,12 @@ def main():
     required = MATH_OPS | TOP_OPS | DIV_OPS
     if set(rows) != required or "34824 vectors" not in log:
         raise RuntimeError(f"incomplete FPU regression; see {OUT / 'fpu_tb.log'}")
-    failures = {name: rows[name][1] for name in MATH_OPS | TOP_OPS if rows[name][1]}
+    failures = {name: rows[name][1] for name in required if rows[name][1]}
     if failures:
-        raise RuntimeError(f"FPU math/top failures: {failures}; see {OUT / 'fpu_tb.log'}")
+        raise RuntimeError(f"FPU failures: {failures}; see {OUT / 'fpu_tb.log'}")
     print(f"PASS FPU math: {sum(rows[n][0] for n in MATH_OPS)} TestFloat/directed checks, all 11 operations")
     print(f"PASS FPU top/CSR/protocol: {sum(rows[n][0] for n in TOP_OPS)} checks")
-    div_fail = sum(rows[n][1] for n in DIV_OPS)
-    if div_fail:
-        print(f"PENDING divide/sqrt: {div_fail} failures outside Bowen's scope (retained in full log)")
+    print(f"PASS FPU divide/sqrt/sequences: {sum(rows[n][0] for n in DIV_OPS)} checks")
     print(f"Logs: {OUT}")
 
 

@@ -362,32 +362,23 @@ module fpu (
     wire [ 9:0] ds_o_exp;
     wire [25:0] ds_o_sig;
 
-    // MISSING UNIT: fpu_divsqrt (Bradly) is not on main yet, so fdiv and
-    // fsqrt return 0 with no flags and never stall (special operands still
-    // work, above). When fpu_divsqrt.v lands, delete the four tie-off
-    // assigns below and uncomment this instance:
-    //
-    // fpu_divsqrt u_divsqrt (
-    //     .i_clk    (i_clk),
-    //     .i_rst    (i_rst),
-    //     .i_valid  (ds_valid),
-    //     .i_advance(i_advance),
-    //     .i_sqrt   (op_fsqrt),
-    //     .i_a_sign (a_sign),
-    //     .i_a_exp  (a_nexp),
-    //     .i_a_sig  (a_nsig),
-    //     .i_b_sign (b_sign),
-    //     .i_b_exp  (b_nexp),
-    //     .i_b_sig  (b_nsig),
-    //     .o_busy   (ds_busy),
-    //     .o_sign   (ds_o_sign),
-    //     .o_exp    (ds_o_exp),
-    //     .o_sig    (ds_o_sig)
-    // );
-    assign ds_busy   = 1'b0;
-    assign ds_o_sign = 1'b0;
-    assign ds_o_exp  = 10'd0;
-    assign ds_o_sig  = 26'd0;
+    fpu_divsqrt u_divsqrt (
+        .i_clk    (i_clk),
+        .i_rst    (i_rst),
+        .i_valid  (ds_valid),
+        .i_advance(i_advance),
+        .i_sqrt   (op_fsqrt),
+        .i_a_sign (a_sign),
+        .i_a_exp  (a_nexp),
+        .i_a_sig  (a_nsig),
+        .i_b_sign (b_sign),
+        .i_b_exp  (b_nexp),
+        .i_b_sig  (b_nsig),
+        .o_busy   (ds_busy),
+        .o_sign   (ds_o_sign),
+        .o_exp    (ds_o_exp),
+        .o_sig    (ds_o_sig)
+    );
 
     wire [31:0] cvt_f2i_result;
     wire [ 4:0] cvt_f2i_flags;
